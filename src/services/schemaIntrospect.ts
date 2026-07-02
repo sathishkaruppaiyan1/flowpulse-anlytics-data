@@ -5,6 +5,10 @@ import { getProjectConnString } from "./projectStore.js";
 export interface ColumnInfo {
   column: string;
   type: string;
+  /** For json/jsonb columns: top-level keys found by sampling real rows. */
+  jsonKeys?: string[];
+  /** Whether the sampled json value is an array of objects or a single object. */
+  jsonContainer?: "array" | "object";
 }
 export interface TableInfo {
   schema: string;
@@ -43,8 +47,56 @@ export async function introspectSchema(
       }
       map.get(key)!.columns.push({ column: r.column_name, type: r.data_type });
     }
-    return [...map.values()];
+
+    const tables = [...map.values()];
+
+    // Sample json/jsonb columns so the LLM knows what's *inside* the blob.
+    // Without this it invents conventional columns (e.g. order_items.quantity).
+    for (const t of tables) {
+      for (const col of t.columns) {
+        if (col.type !== "jsonb" && col.type !== "json") continue;
+        try {
+          const rel = `${quoteIdent(t.schema)}.${quoteIdent(t.table)}`;
+          const c = quoteIdent(col.column);
+
+          const typeRes = await client.query<{ t: string | null }>(
+            `select jsonb_typeof(${c}::jsonb) as t
+             from ${rel} where ${c} is not null limit 1`
+          );
+          const container = typeRes.rows[0]?.t;
+          if (container !== "array" && container !== "object") continue;
+
+          const sample = `(select ${c}::jsonb as v from ${rel} where ${c} is not null limit 50) a`;
+          const keysSql =
+            container === "array"
+              ? `select distinct jsonb_object_keys(elem) as k
+                 from (select jsonb_array_elements(v) as elem from ${sample}) b
+                 where jsonb_typeof(elem) = 'object'
+                 order by 1 limit 60`
+              : `select distinct jsonb_object_keys(v) as k
+                 from ${sample}
+                 order by 1 limit 60`;
+          const keysRes = await client.query<{ k: string }>(keysSql);
+          const keys = keysRes.rows.map((r2) => r2.k);
+          if (keys.length > 0) {
+            col.jsonKeys = keys;
+            col.jsonContainer = container;
+          }
+        } catch (e) {
+          // Sampling is best-effort; never let it break introspection.
+          if (process.env.DEBUG_JSON_SAMPLE)
+            console.error(`[json-sample] ${t.table}.${col.column}:`, (e as Error).message);
+        }
+      }
+    }
+
+    return tables;
   });
+}
+
+/** Quote a Postgres identifier for safe interpolation. */
+function quoteIdent(id: string): string {
+  return `"${id.replace(/"/g, '""')}"`;
 }
 
 /** Return cached schema for a project, refreshing if missing or stale (>1h). */
@@ -88,7 +140,16 @@ export function schemaToPrompt(tables: TableInfo[]): string {
     .map(
       (t) =>
         `${t.schema}.${t.table}(${t.columns
-          .map((c) => `${c.column} ${c.type}`)
+          .map((c) => {
+            if (c.jsonKeys && c.jsonKeys.length > 0) {
+              const shape =
+                c.jsonContainer === "array"
+                  ? "array of objects with keys"
+                  : "object with keys";
+              return `${c.column} ${c.type} /* ${shape}: ${c.jsonKeys.join(", ")} */`;
+            }
+            return `${c.column} ${c.type}`;
+          })
           .join(", ")})`
     )
     .join("\n");
