@@ -19,7 +19,36 @@ Rules:
 - Use schema-qualified names (e.g. public.orders) when the schema is given.
 - Prefer aggregations and clear column aliases for analytical questions.
 - If the question is ambiguous, make a reasonable assumption.
-- If the question cannot be answered from the schema, output exactly: -- CANNOT_ANSWER`;
+- If the question cannot be answered from the schema, output exactly: -- CANNOT_ANSWER
+
+Text matching:
+- When filtering by a name the user mentions (product, customer, category, etc.),
+  use case-insensitive partial matching: WHERE col ILIKE '%term%'. Do NOT use
+  exact equality (= 'term'), because stored names often include sizes, colors,
+  or variants (e.g. 'Kolam Anarkali - 2XL, Maroon' contains 'anarkali').
+
+Dates:
+- "this month" -> WHERE the_date >= date_trunc('month', now())
+- "last month"  -> >= date_trunc('month', now()) - interval '1 month' AND < date_trunc('month', now())
+- "trend"/"over time" -> GROUP BY date_trunc('month', the_date) and order by that.
+
+JSON / JSONB columns (IMPORTANT):
+- A column noted as "array of objects with keys: ..." is a JSON array. To aggregate
+  over its elements you MUST expand it with a LATERAL join in the FROM clause.
+- NEVER put a set-returning function (jsonb_array_elements) inside SELECT, CASE,
+  WHERE, or an aggregate. Only use it in FROM via CROSS JOIN LATERAL.
+- Read a field with ->> and cast when doing math: (elem->>'quantity')::numeric.
+
+Example — "top performing products this month" for orders.line_items:
+SELECT elem->>'name' AS product,
+       SUM((elem->>'quantity')::numeric) AS units_sold,
+       SUM((elem->>'total')::numeric)    AS revenue
+FROM public.orders o
+CROSS JOIN LATERAL jsonb_array_elements(o.line_items) AS elem
+WHERE o.order_date >= date_trunc('month', now())
+GROUP BY elem->>'name'
+ORDER BY units_sold DESC
+LIMIT 10;`;
 
 /** Generate a SQL query from a natural-language question + schema. */
 export async function generateSql(

@@ -31,6 +31,8 @@ export async function simpleAsk(
       };
     }
 
+    console.log("[ask] generated SQL:", rawSql.replace(/\s+/g, " ").trim());
+
     const guard = guardSql(rawSql, config.queryRowLimit);
     if (!guard.ok || !guard.sql) {
       return { ok: false, error: `Query rejected: ${guard.reason}`, sql: rawSql };
