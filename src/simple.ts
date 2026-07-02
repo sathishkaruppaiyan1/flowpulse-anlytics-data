@@ -12,7 +12,7 @@ import {
   type TableInfo,
 } from "./services/schemaIntrospect.js";
 import { simpleAsk } from "./services/simpleAsk.js";
-import { renderValues, asPre } from "./services/report.js";
+import { renderValues, renderTable, asPre } from "./services/report.js";
 
 async function main() {
   requireSimpleConfig();
@@ -86,7 +86,13 @@ async function main() {
     }
     await ctx.reply(result.answer!);
     if (result.output && result.output.rows.length > 0) {
-      await ctx.reply(renderValues(result.output));
+      // One row -> plain text (clean, no code block). Multiple rows -> aligned
+      // table so lists are easy to read (Telegram shows a copy icon on tables).
+      if (result.output.rows.length === 1) {
+        await ctx.reply(renderValues(result.output));
+      } else {
+        await ctx.reply(asPre(renderTable(result.output)), { parse_mode: "HTML" });
+      }
     }
   });
 

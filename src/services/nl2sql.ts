@@ -17,7 +17,11 @@ Rules:
 - Use ONLY tables and columns from the provided schema. Never invent names.
 - Always produce a SELECT (or WITH ... SELECT). Never write/modify data.
 - Use schema-qualified names (e.g. public.orders) when the schema is given.
+- If you reference a table by an alias (e.g. o.order_date), you MUST declare that
+  alias in FROM (FROM public.orders o). Keep aliases consistent throughout.
 - Prefer aggregations and clear column aliases for analytical questions.
+- Order revenue / total sales is the numeric column public.orders.total. Use it
+  directly (SUM(o.total)); only expand line_items for PER-PRODUCT metrics.
 - If the question is ambiguous, make a reasonable assumption.
 - If the question cannot be answered from the schema, output exactly: -- CANNOT_ANSWER
 
@@ -38,6 +42,10 @@ JSON / JSONB columns (IMPORTANT):
 - NEVER put a set-returning function (jsonb_array_elements) inside SELECT, CASE,
   WHERE, or an aggregate. Only use it in FROM via CROSS JOIN LATERAL.
 - Read a field with ->> and cast when doing math: (elem->>'quantity')::numeric.
+- ->> always returns TEXT, so cast INSIDE the aggregate:
+  SUM((elem->>'total')::numeric) -- correct
+  SUM(elem->>'total')            -- WRONG: "function sum(text) does not exist"
+  SUM(elem->>'total')::numeric   -- WRONG: casts after summing text; still fails
 
 Example — "top performing products this month" for orders.line_items:
 SELECT elem->>'name' AS product,
