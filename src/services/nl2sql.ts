@@ -63,12 +63,17 @@ export async function generateSql(
   question: string,
   schemaText: string
 ): Promise<string> {
+  const glossary = config.businessGlossary.trim();
+  const system = glossary
+    ? `${SQL_SYSTEM}\n\nBusiness definitions (the user's terms -> how to query them; follow these exactly):\n${glossary}`
+    : SQL_SYSTEM;
+
   const completion = await client.chat.completions.create({
     model: config.llmModel,
     temperature: 0,
     max_tokens: 1024,
     messages: [
-      { role: "system", content: SQL_SYSTEM },
+      { role: "system", content: system },
       { role: "user", content: `Schema:\n${schemaText}\n\nQuestion: ${question}` },
     ],
   });

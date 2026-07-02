@@ -35,6 +35,10 @@ export const config = {
   encryptionKey: process.env.ENCRYPTION_KEY || "",
   queryRowLimit: optionalNumber("QUERY_ROW_LIMIT", 500),
   queryTimeoutMs: optionalNumber("QUERY_TIMEOUT_MS", 15000),
+  // Optional business glossary: plain-English definitions mapping the user's
+  // terms (e.g. "tracking stage") to concrete SQL rules. Injected into the
+  // NL->SQL prompt so the model understands domain-specific language.
+  businessGlossary: process.env.BUSINESS_GLOSSARY || "",
 } as const;
 
 export function requireSimpleConfig(): void {
