@@ -12,7 +12,7 @@ import {
   type TableInfo,
 } from "./services/schemaIntrospect.js";
 import { simpleAsk } from "./services/simpleAsk.js";
-import { renderTable, asPre } from "./services/report.js";
+import { renderValues, asPre } from "./services/report.js";
 
 async function main() {
   requireSimpleConfig();
@@ -86,7 +86,7 @@ async function main() {
     }
     await ctx.reply(result.answer!);
     if (result.output && result.output.rows.length > 0) {
-      await ctx.reply(asPre(renderTable(result.output)), { parse_mode: "HTML" });
+      await ctx.reply(renderValues(result.output));
     }
   });
 

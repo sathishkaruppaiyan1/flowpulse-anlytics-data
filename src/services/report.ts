@@ -30,6 +30,28 @@ export function renderTable(output: QueryOutput, maxRows = 15): string {
   return out;
 }
 
+/**
+ * Render a result set as plain text (no HTML/code block, so Telegram shows no
+ * "copy code" button). One row per line; exact values, not summarized.
+ */
+export function renderValues(output: QueryOutput, maxRows = 30): string {
+  if (output.rows.length === 0) return "(no results)";
+
+  const cols = output.columns;
+  const rows = output.rows.slice(0, maxRows);
+
+  const lines = rows.map((r) => {
+    if (cols.length === 1) return String(r[cols[0]] ?? "");
+    return cols.map((c) => `${c}: ${r[c] ?? ""}`).join(", ");
+  });
+
+  let out = lines.join("\n");
+  if (output.rows.length > maxRows) {
+    out += `\n... ${output.rows.length - maxRows} more row(s)`;
+  }
+  return out;
+}
+
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
