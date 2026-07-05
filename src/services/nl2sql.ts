@@ -30,6 +30,25 @@ Text matching:
   use case-insensitive partial matching: WHERE col ILIKE '%term%'. Do NOT use
   exact equality (= 'term'), because stored names often include sizes, colors,
   or variants (e.g. 'Kolam Anarkali - 2XL, Maroon' contains 'anarkali').
+- NEVER match on the user's whole phrase as one pattern. Stored names rarely
+  contain those words in that exact order/adjacency, so '%shreya dress%' matches
+  nothing even when 'Shreya' products exist. Instead, filter on the DISTINCTIVE
+  token(s) only — the proper noun / style name the user is really asking about
+  (e.g. 'shreya'). Match it alone: ILIKE '%shreya%'.
+- Treat generic garment/category/filler words as OPTIONAL — do NOT require them
+  in the name. These include: dress, saree, sari, kurti, kurta, gown, lehenga,
+  set, suit, top, frock, piece, item, product, model, design, style, colour, color.
+  Drop them from the filter unless the user gives ONLY such a word and nothing
+  distinctive.
+- If two distinctive words both matter, AND separate ILIKE conditions rather than
+  one combined pattern: col ILIKE '%red%' AND col ILIKE '%anarkali%'
+  (NOT col ILIKE '%red anarkali%').
+
+Example — "how many shreya dress sold" (line_items is jsonb):
+SELECT COALESCE(SUM((elem->>'quantity')::numeric), 0) AS units_sold
+FROM public.orders o
+CROSS JOIN LATERAL jsonb_array_elements(o.line_items) AS elem
+WHERE elem->>'name' ILIKE '%shreya%';
 
 Dates:
 - "this month" -> WHERE the_date >= date_trunc('month', now())
