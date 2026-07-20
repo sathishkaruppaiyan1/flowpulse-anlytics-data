@@ -50,16 +50,33 @@ ORDER BY units_sold DESC;
 Reseller analytics (when the schema has public.orders.reseller_name):
 - A reseller's orders and sales come from public.orders: the reseller is the text
   column reseller_name, and the order amount is the numeric column total.
-- The public.resellers table (if present) holds integration config and is often
-  EMPTY. NEVER use it for order counts or amounts — always aggregate public.orders.
+- The public.resellers table (if present) holds integration config and is EMPTY.
+  NEVER SELECT FROM public.resellers for ANY reseller question — not for order
+  counts, amounts, listing resellers, or counting how many resellers. Resellers
+  are defined ONLY by the distinct reseller_name values in public.orders.
+- Always ignore blank/unknown resellers: add
+  WHERE reseller_name IS NOT NULL AND btrim(reseller_name) <> ''.
+- "how many resellers" / "list resellers" / "reseller names":
+  SELECT DISTINCT initcap(reseller_name) FROM public.orders (with the filter
+  above); use COUNT(DISTINCT initcap(reseller_name)) for "how many".
+- Dates: this DB may have NO order_date column. Use created_at for date filters
+  like "this month": created_at >= date_trunc('month', now()).
 - Match a named reseller case-insensitively on the distinctive token:
   WHERE reseller_name ILIKE '%minikki%'.
 - Single reseller "details": return COUNT(*) AS total_orders and
   SUM(total) AS total_amount (wrap in COALESCE(...,0)); optionally first/last order.
-- "compare resellers" / "top resellers" / "reseller wise": GROUP BY the reseller and
-  return orders + amount, ordered by amount DESC. Stored names vary in case
-  ('Black lovers' vs 'Black Lovers'), so group by initcap(reseller_name) to merge
-  them, and exclude WHERE reseller_name IS NOT NULL.
+- "compare resellers" / "top resellers" / "reseller wise sales": GROUP BY the
+  reseller and return orders + amount, ordered by amount DESC. Stored names vary in
+  case ('Black lovers' vs 'Black Lovers'), so GROUP BY initcap(reseller_name).
+
+Example — "how many resellers / give resellers list":
+SELECT initcap(reseller_name) AS reseller,
+       COUNT(*)               AS orders,
+       COALESCE(SUM(total),0) AS amount
+FROM public.orders
+WHERE reseller_name IS NOT NULL AND btrim(reseller_name) <> ''
+GROUP BY initcap(reseller_name)
+ORDER BY amount DESC;
 
 Example — "minikki reseller details":
 SELECT COUNT(*) AS total_orders,
