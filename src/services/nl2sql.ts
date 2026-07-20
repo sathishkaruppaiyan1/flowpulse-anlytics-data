@@ -23,7 +23,58 @@ Rules:
 - Order revenue / total sales is the numeric column public.orders.total. Use it
   directly (SUM(o.total)); only expand line_items for PER-PRODUCT metrics.
 - If the question is ambiguous, make a reasonable assumption.
+
+Where product data lives (CRITICAL):
+- The public.products table is EMPTY. NEVER read from it for any product question.
+- ALL product information (names, prices, quantities sold, sizes, colors, sku)
+  lives inside public.orders.line_items, a JSONB array of objects with keys:
+  name, quantity, price, total, size, color, sku, product_id.
+- For ANY product question -- "details", "how many sold", "revenue", "price",
+  "sizes", "variants" -- expand line_items with CROSS JOIN LATERAL
+  jsonb_array_elements and read fields off each element. Do NOT touch public.products.
+- "product details" -> aggregate the matching line-items: total units
+  (SUM(quantity)), revenue (SUM(total)), price, distinct sizes/colors, order count.
+
+Example -- "shreya maxi product details":
+SELECT elem->>'name'                          AS variant,
+       (elem->>'price')::numeric              AS price,
+       SUM((elem->>'quantity')::numeric)      AS units_sold,
+       SUM((elem->>'total')::numeric)         AS revenue
+FROM public.orders o
+CROSS JOIN LATERAL jsonb_array_elements(o.line_items) AS elem
+WHERE elem->>'name' ILIKE '%shreya%'
+GROUP BY elem->>'name', (elem->>'price')::numeric
+ORDER BY units_sold DESC;
 - If the question cannot be answered from the schema, output exactly: -- CANNOT_ANSWER
+
+Reseller analytics (when the schema has public.orders.reseller_name):
+- A reseller's orders and sales come from public.orders: the reseller is the text
+  column reseller_name, and the order amount is the numeric column total.
+- The public.resellers table (if present) holds integration config and is often
+  EMPTY. NEVER use it for order counts or amounts — always aggregate public.orders.
+- Match a named reseller case-insensitively on the distinctive token:
+  WHERE reseller_name ILIKE '%minikki%'.
+- Single reseller "details": return COUNT(*) AS total_orders and
+  SUM(total) AS total_amount (wrap in COALESCE(...,0)); optionally first/last order.
+- "compare resellers" / "top resellers" / "reseller wise": GROUP BY the reseller and
+  return orders + amount, ordered by amount DESC. Stored names vary in case
+  ('Black lovers' vs 'Black Lovers'), so group by initcap(reseller_name) to merge
+  them, and exclude WHERE reseller_name IS NOT NULL.
+
+Example — "minikki reseller details":
+SELECT COUNT(*) AS total_orders,
+       COALESCE(SUM(o.total), 0) AS total_amount
+FROM public.orders o
+WHERE o.reseller_name ILIKE '%minikki%';
+
+Example — "compare resellers by sales" / "top resellers":
+SELECT initcap(o.reseller_name) AS reseller,
+       COUNT(*)                 AS total_orders,
+       COALESCE(SUM(o.total),0) AS total_amount
+FROM public.orders o
+WHERE o.reseller_name IS NOT NULL
+GROUP BY initcap(o.reseller_name)
+ORDER BY total_amount DESC;
 
 Text matching:
 - When filtering by a name the user mentions (product, customer, category, etc.),

@@ -29,6 +29,7 @@ export const config = {
   llmBaseUrl: process.env.LLM_BASE_URL || "https://api.groq.com/openai/v1",
   llmModel: process.env.LLM_MODEL || "qwen-2.5-coder-32b",
   // Simple mode: one Supabase/Postgres connection the bot reads directly.
+  // Kept for backward compatibility; treated as the "blacklovers" database.
   dataDbUrl: process.env.DATA_DB_URL || "",
   // Multi-tenant mode only (optional): control-plane DB + credential encryption.
   controlDbUrl: process.env.CONTROL_DB_URL || "",
@@ -41,8 +42,41 @@ export const config = {
   businessGlossary: process.env.BUSINESS_GLOSSARY || "",
 } as const;
 
+/** A named database the simple-mode bot can route questions to. */
+export interface DbConfig {
+  key: string;
+  label: string;
+  url: string;
+}
+
+/**
+ * The databases configured for simple mode, in menu order. The first is the
+ * default/primary store. Reseller is added only when its URL is set, so a
+ * single-DB deploy keeps working unchanged.
+ *   DATA_DB_URL / DATA_DB_URL_BLACKLOVERS -> Blacklovers
+ *   DATA_DB_URL_RESELLER                  -> Reseller
+ */
+export function configuredDatabases(): DbConfig[] {
+  const list: DbConfig[] = [];
+  const blacklovers =
+    process.env.DATA_DB_URL_BLACKLOVERS || process.env.DATA_DB_URL || "";
+  if (blacklovers.trim())
+    list.push({ key: "blacklovers", label: "Blacklovers", url: blacklovers });
+
+  const reseller = process.env.DATA_DB_URL_RESELLER || "";
+  if (reseller.trim())
+    list.push({ key: "reseller", label: "Reseller", url: reseller });
+
+  return list;
+}
+
 export function requireSimpleConfig(): void {
-  requiredConfigured("DATA_DB_URL", config.dataDbUrl);
+  if (configuredDatabases().length === 0) {
+    throw new Error(
+      "No database configured. Set DATA_DB_URL (Blacklovers) and optionally " +
+        "DATA_DB_URL_RESELLER. See .env.example"
+    );
+  }
 }
 
 export function requireMultiTenantConfig(): void {
