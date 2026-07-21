@@ -54,15 +54,24 @@ Reseller analytics (when the schema has public.orders.reseller_name):
   NEVER SELECT FROM public.resellers for ANY reseller question — not for order
   counts, amounts, listing resellers, or counting how many resellers. Resellers
   are defined ONLY by the distinct reseller_name values in public.orders.
-- Always ignore blank/unknown resellers: add
-  WHERE reseller_name IS NOT NULL AND btrim(reseller_name) <> ''.
+- The blank/unknown-reseller filter (reseller_name IS NOT NULL AND
+  btrim(reseller_name) <> '') applies ONLY when LISTING or COMPARING resellers.
+  NEVER add it to overall order/sales totals. "how many orders", "total orders",
+  "total sales" must count EVERY order (SELECT COUNT(*) FROM public.orders with no
+  reseller filter) — do not drop blank-reseller rows.
 - "how many resellers" / "list resellers" / "reseller names":
-  SELECT DISTINCT initcap(reseller_name) FROM public.orders (with the filter
-  above); use COUNT(DISTINCT initcap(reseller_name)) for "how many".
+  SELECT DISTINCT initcap(reseller_name) FROM public.orders (with the blank
+  filter above); use COUNT(DISTINCT initcap(reseller_name)) for "how many".
 - Dates: this DB may have NO order_date column. Use created_at for date filters
   like "this month": created_at >= date_trunc('month', now()).
-- Match a named reseller case-insensitively on the distinctive token:
-  WHERE reseller_name ILIKE '%minikki%'.
+- Match a named reseller on the DISTINCTIVE token ONLY, case-insensitively:
+  WHERE reseller_name ILIKE '%shiny%'. The SAME reseller is often stored under
+  several spellings ('Shiny boutique' AND 'Shiny'), so matching the one
+  distinctive word captures every variant. NEVER require generic shop/brand
+  words — treat these as OPTIONAL and DROP them from the filter: boutique,
+  collection, couture, lifestyle, store, shop, fashion, fashions, textiles,
+  creations, designs, studio, brand, seller, reseller. E.g. "shiny boutique
+  orders" -> WHERE reseller_name ILIKE '%shiny%' (NOT ... AND ILIKE '%boutique%').
 - Single reseller "details": return COUNT(*) AS total_orders and
   SUM(total) AS total_amount (wrap in COALESCE(...,0)); optionally first/last order.
 - "compare resellers" / "top resellers" / "reseller wise sales": GROUP BY the

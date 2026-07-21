@@ -18,12 +18,16 @@ export interface ResellerReport {
 }
 
 // Words that are never part of a reseller's name in a "details" request.
+// Includes generic shop/brand words so the same reseller stored under several
+// spellings ('Shiny boutique' vs 'Shiny') is matched by its distinctive token.
 const FILLERS = new Set([
   "complete", "full", "all", "details", "detail", "report", "reports",
   "reseller", "resellers", "reselling", "give", "get", "show", "send", "me",
   "the", "of", "for", "with", "and", "please", "total", "orders", "order",
   "amount", "amounts", "top", "product", "products", "csv", "pdf", "his", "her",
   "their", "info", "information", "summary", "data", "sales", "value", "values",
+  "boutique", "collection", "couture", "lifestyle", "store", "shop", "fashion",
+  "fashions", "textiles", "creations", "designs", "studio", "brand", "seller",
 ]);
 
 /** True when the message is asking for a full/complete reseller report. */
