@@ -16,6 +16,7 @@ import {
   type TableInfo,
 } from "./services/schemaIntrospect.js";
 import { simpleAsk } from "./services/simpleAsk.js";
+import { answerCancelledQuestion } from "./services/cancelledAsk.js";
 import { routeToDb } from "./services/dbRouter.js";
 import {
   parseReportRequest,
@@ -149,8 +150,22 @@ async function main() {
     question: string
   ): Promise<void> {
     await ctx.replyWithChatAction("typing");
-    const result = await simpleAsk(db.conn, db.schemaText, question);
     const tag = multiDb ? `[${db.label}] ` : "";
+
+    // Cancellations live only in WooCommerce, so generated SQL always answers
+    // 0. Answer those from the store itself; everything else carries on to the
+    // normal pipeline, and so does a cancellation question this can't settle.
+    try {
+      const cancelled = await answerCancelledQuestion(db.conn, question);
+      if (cancelled) {
+        await ctx.reply(`${tag}${cancelled}`);
+        return;
+      }
+    } catch (e) {
+      console.error("[simple] cancelled-order lookup failed:", e);
+    }
+
+    const result = await simpleAsk(db.conn, db.schemaText, question);
 
     if (!result.ok) {
       await ctx.reply(`${tag}Warning: ${result.error}`);

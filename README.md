@@ -86,7 +86,10 @@ Each report contains:
 - **Summary** - date range, total and net order count and value
 - **Orders by status** - counts and value per status, cancelled ones flagged
 - **Order details** - one row per product per order: S.No, order ID, product
-  photo, product, customer name, customer phone, size / qty, price, status
+  photo, product, customer name, customer phone, size / qty, price, status.
+  S.No counts **orders, not lines**: an order with two products fills two rows
+  under one number, with the order id, customer and phone shown once, so a
+  two-product order no longer reads as two orders
 - **Cancelled orders** - the cancelled ones again on their own, when there are any
 
 Cancelled orders (status matching cancel / refund / return / failed / rejected)
@@ -112,6 +115,11 @@ Credentials come from the `public.woocommerce_settings` row the importer already
 uses; no extra configuration. The list is cached for five minutes, and if the
 store can't be reached the report is built from the database alone - the same
 numbers as before, never worse.
+
+Asking about cancellations in passing ("how many cancelled orders are there?")
+is answered from the same WooCommerce list rather than by generated SQL, which
+would otherwise answer 0 every time for the reason above. Questions about
+anything else go to the normal question pipeline untouched.
 
 Product photos are downscaled to thumbnails and cached on disk, so a report of
 900 orders fetches roughly 90 distinct images once and reuses them.
@@ -152,7 +160,7 @@ The safety model uses:
 | Read-only executor | `src/services/executor.ts`, `src/services/clientDb.ts` |
 | Schema introspection | `src/services/schemaIntrospect.ts` |
 | Reseller PDF/CSV reports | `src/services/resellerReport.ts`, `src/services/pdf.ts`, `src/services/dateRange.ts` |
-| WooCommerce cancellation overlay | `src/services/wooStatus.ts` |
+| WooCommerce cancellation overlay | `src/services/wooStatus.ts`, `src/services/cancelledAsk.ts` |
 | Product photo thumbnails | `src/services/productImages.ts` |
 | Report fonts (rupee sign, Tamil) | `assets/fonts/` |
 | Tenant/project store | `src/services/projectStore.ts` |

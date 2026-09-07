@@ -218,7 +218,11 @@ export interface ResellerIdentity {
  * reached through its name, and Cod Corner is reached from there through the
  * number they share.
  */
-export function groupResellers(rows: ResellerIdentity[]): Candidate[] {
+export function groupResellers(identities: ResellerIdentity[]): Candidate[] {
+  // Sorted here rather than trusted from the caller: the name a group is shown
+  // under is simply the first one seen, so an unordered caller would label
+  // Dreams couture's account "Cod corner" on the strength of two orders.
+  const rows = [...identities].sort((a, b) => b.orders - a.orders);
   const parent = rows.map((_, i) => i);
   const find = (i: number): number => {
     while (parent[i] !== i) i = parent[i] = parent[parent[i]];
@@ -341,6 +345,23 @@ export interface Candidate {
 const MATCH_THRESHOLD = 0.62;
 
 /**
+ * How well a reseller answers what was typed, over every name they use and
+ * every single word of the request.
+ *
+ * Both halves matter. Every name, because "cod corner" has to reach the account
+ * whose reports are headed "Dreams couture". Every single word, because one
+ * mistyped word used to sink the whole request: "dreams couture august month
+ * order setails" scored "dreams setails" against "Dreams couture" and found no
+ * reseller at all, when "dreams" on its own is a certain match.
+ */
+function bestScore(tokens: string[], c: Candidate): number {
+  const attempts = [tokens, ...tokens.map((t) => [t])];
+  return Math.max(
+    ...c.names.flatMap((n) => attempts.map((a) => scoreName(a, n)))
+  );
+}
+
+/**
  * Pick the reseller the user meant. Returns the best match plus the full
  * candidate list, so the caller can offer a choice when nothing scores well or
  * two names score alike.
@@ -349,14 +370,8 @@ export function resolveReseller(
   tokens: string[],
   candidates: Candidate[]
 ): { match?: Candidate; ambiguous: boolean; ranked: Candidate[] } {
-  // Scored against every name the reseller uses, not just the one on show:
-  // "cod corner" has to reach the account whose reports are headed
-  // "Dreams couture".
   const scored = candidates
-    .map((c) => ({
-      c,
-      score: Math.max(...c.names.map((n) => scoreName(tokens, n))),
-    }))
+    .map((c) => ({ c, score: bestScore(tokens, c) }))
     .sort((a, b) => b.score - a.score || b.c.orders - a.c.orders);
 
   const best = scored[0];
@@ -769,21 +784,51 @@ function detailColumns(): Column[] {
   ];
 }
 
+/**
+ * Numbered by ORDER, not by line. An order with two products fills two rows,
+ * and giving each row its own S.No made one order read as two of them - order
+ * 13391, one order for a size M and a size L, looked like a duplicate. The
+ * order-level cells are blanked on the continuation rows, so each order is
+ * shown once as a single block. Lines arrive grouped by order, so comparing
+ * with the previous row is enough.
+ */
 function detailRows(lines: LineRow[], thumbs?: Map<string, Buffer>): PdfRow[] {
-  return lines.map((l, i) => ({
-    cells: [
-      i + 1,
-      l.order_number,
-      (l.image && thumbs?.get(l.image)) || "",
-      l.product || "(no line items)",
-      l.customer,
-      l.phone,
-      sizeQty(l),
-      l.product ? inr(l.price) : inr(l.order_total),
-      statusLabel(l.status),
-    ],
-    highlight: isCancelled(l.status),
-  }));
+  let serial = 0;
+  let previous: string | null = null;
+  return lines.map((l) => {
+    const firstOfOrder = l.order_number !== previous;
+    if (firstOfOrder) serial++;
+    previous = l.order_number;
+    return {
+      cells: [
+        firstOfOrder ? serial : "",
+        firstOfOrder ? l.order_number : "",
+        (l.image && thumbs?.get(l.image)) || "",
+        l.product || "(no line items)",
+        firstOfOrder ? l.customer : "",
+        firstOfOrder ? l.phone : "",
+        sizeQty(l),
+        l.product ? inr(l.price) : inr(l.order_total),
+        firstOfOrder ? statusLabel(l.status) : "",
+      ],
+      highlight: isCancelled(l.status),
+    };
+  });
+}
+
+/**
+ * S.No per order for the CSV too, so the two files number orders alike. Unlike
+ * the PDF every column stays filled: a spreadsheet gets sorted and filtered,
+ * and blank cells would strand the continuation rows.
+ */
+function orderSerials(lines: LineRow[]): number[] {
+  let serial = 0;
+  let previous: string | null = null;
+  return lines.map((l) => {
+    if (l.order_number !== previous) serial++;
+    previous = l.order_number;
+    return serial;
+  });
 }
 
 export async function buildPdf(d: ReportData): Promise<Buffer> {
@@ -911,10 +956,11 @@ export function buildCsv(d: ReportData): string {
       "order_status", "cancelled", "order_total", "product_image",
     ])
   );
+  const serials = orderSerials(d.lines);
   d.lines.forEach((l, i) => {
     lines.push(
       csvRow([
-        i + 1,
+        serials[i],
         l.order_number,
         ymd(l.created_at),
         l.product,
