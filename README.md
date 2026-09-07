@@ -62,13 +62,28 @@ summary plus **both a PDF and a CSV** - no need to ask for a format:
 - `minikki complete details`
 - `shiny june 2025 orders`
 
-Reseller names are matched fuzzily, so `dreamcouture` finds `Dreams couture`,
-and spellings of one reseller (`Cod Corner` / `Cod corner`) are counted as one.
-When the name is unclear the bot offers the known names as buttons.
+Reseller names are matched fuzzily, so `dreamcouture` finds `Dreams couture`.
+
+A report covers the **account**, not the name typed. Two records belong to the
+same reseller when they share a name *or* share a `reseller_number`, followed
+transitively, because neither field is reliable on its own:
+
+- one account files orders under more than one shop name - `Cod Corner` and
+  `Dreams couture` are the same person, so asking for either returns all 2,051
+  of their orders
+- one shop types its number inconsistently - `Be Legend Collection` appears
+  under four numbers and is still one reseller
+- spellings and generic shop words are folded together: `Cod Corner` / `Cod
+  corner`, `Shiny` / `Shiny boutique`
+- orders with a number but no name at all still land in the right report
+
+Every name the report swept in is listed in the summary ("Also includes orders
+placed under: ..."), so a total is never quietly larger than the name suggests.
+When the name is unclear the bot offers the known resellers as buttons.
 
 Each report contains:
 
-- **Summary** - date range, total order count, total order value
+- **Summary** - date range, total and net order count and value
 - **Orders by status** - counts and value per status, cancelled ones flagged
 - **Order details** - one row per product per order: S.No, order ID, product
   photo, product, customer name, customer phone, size / qty, price, status
@@ -76,10 +91,27 @@ Each report contains:
 
 Cancelled orders (status matching cancel / refund / return / failed / rejected)
 are highlighted in red in the PDF and carry a `cancelled` column in the CSV.
+Every total is reported both gross and **net of cancellations** - the net figure
+is the one to bill on.
 
 Orders are read from `public.orders` **union** `public.completed_orders`, since
 finished orders are moved into that archive and a report reading only the live
-table silently loses them.
+table silently loses them, **union WooCommerce's cancelled / refunded / failed
+orders**, fetched live from the store's REST API.
+
+That last source is not an optimisation, it is the only way to be right about
+cancellations. The importer that fills the database is one-way: it pushes
+fulfilment stages *into* WooCommerce and never reads a status change back, so
+`orders.status` only ever holds `processing` / `packing` / `packed` / `shipped`.
+An order cancelled in WooCommerce therefore either keeps whatever stage it had
+when it was cancelled, or - if it was already cancelled when the importer first
+saw it - never reaches the database at all. Reports overlay the store's own
+called-off list to correct the first case and add back the second.
+
+Credentials come from the `public.woocommerce_settings` row the importer already
+uses; no extra configuration. The list is cached for five minutes, and if the
+store can't be reached the report is built from the database alone - the same
+numbers as before, never worse.
 
 Product photos are downscaled to thumbnails and cached on disk, so a report of
 900 orders fetches roughly 90 distinct images once and reuses them.
@@ -120,6 +152,7 @@ The safety model uses:
 | Read-only executor | `src/services/executor.ts`, `src/services/clientDb.ts` |
 | Schema introspection | `src/services/schemaIntrospect.ts` |
 | Reseller PDF/CSV reports | `src/services/resellerReport.ts`, `src/services/pdf.ts`, `src/services/dateRange.ts` |
+| WooCommerce cancellation overlay | `src/services/wooStatus.ts` |
 | Product photo thumbnails | `src/services/productImages.ts` |
 | Report fonts (rupee sign, Tamil) | `assets/fonts/` |
 | Tenant/project store | `src/services/projectStore.ts` |

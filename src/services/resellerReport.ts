@@ -5,7 +5,9 @@
 // This is a deterministic, code-driven report (not LLM SQL) so the numbers are
 // always consistent. Orders come from public.orders UNION the archive in
 // public.completed_orders, because orders are moved out of the live table once
-// they finish and a report that reads only public.orders silently loses them.
+// they finish and a report that reads only public.orders silently loses them,
+// UNION the orders WooCommerce says were called off, because the database is
+// never told about a cancellation - see wooStatus.ts.
 
 import { withClientConnection } from "./clientDb.js";
 import { config } from "../config.js";
@@ -17,6 +19,7 @@ import {
 } from "./dateRange.js";
 import { PdfReport, type Column, type Row as PdfRow } from "./pdf.js";
 import { loadThumbnails } from "./productImages.js";
+import { loadCalledOffOrders } from "./wooStatus.js";
 
 export interface ReportFile {
   filename: string;
@@ -167,6 +170,113 @@ export function normalizeName(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
+/**
+ * Grouping key for a reseller: the distinctive part of the name, with the
+ * generic shop words dropped exactly as they are dropped from what the user
+ * types. One reseller is stored under several spellings, and normalizeName
+ * alone keeps them apart — "Shiny" and "Shiny boutique" are the same shop, as
+ * are "Belegend Collection" and "Be Legend Collection", and reporting on one
+ * spelling silently loses the orders filed under the other.
+ *
+ * Falls back to the whole name when every word is generic ("Black lovers"),
+ * which would otherwise key on nothing at all.
+ */
+export function resellerKey(s: string): string {
+  const words = s.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  const distinctive = words.filter((w) => !FILLERS.has(w));
+  return (distinctive.length > 0 ? distinctive : words).join("");
+}
+
+/**
+ * Comparison form of a reseller's phone number: digits only, with the country
+ * code dropped, so "917338733187" and "7338733187" are one account.
+ */
+export function normalizeNumber(s: string): string {
+  const digits = (s ?? "").replace(/\D/g, "");
+  return digits.length > 10 && digits.startsWith("91") ? digits.slice(-10) : digits;
+}
+
+/** One (name, number) pairing found in the data, with how many orders use it. */
+export interface ResellerIdentity {
+  name: string;
+  number: string;
+  orders: number;
+}
+
+/**
+ * Fold the (name, number) pairings in the data down to one candidate per
+ * reseller.
+ *
+ * A reseller is not identified by either field on its own. One account files
+ * orders under more than one shop name - "Cod Corner" and "Dreams couture" are
+ * the same person, and asking for either has to return all of their orders -
+ * while one shop types its number inconsistently, so "Be Legend Collection"
+ * appears under four numbers and is still one reseller.
+ *
+ * So two pairings belong together when they share a name or share a number, and
+ * that relation is followed transitively: Dreams couture's second account is
+ * reached through its name, and Cod Corner is reached from there through the
+ * number they share.
+ */
+export function groupResellers(rows: ResellerIdentity[]): Candidate[] {
+  const parent = rows.map((_, i) => i);
+  const find = (i: number): number => {
+    while (parent[i] !== i) i = parent[i] = parent[parent[i]];
+    return i;
+  };
+  const union = (a: number, b: number) => {
+    const [ra, rb] = [find(a), find(b)];
+    if (ra !== rb) parent[rb] = ra;
+  };
+
+  // Link every pairing to the first one sharing its name, and to the first one
+  // sharing its number; union-find turns those links into whole groups.
+  const firstByName = new Map<string, number>();
+  const firstByNumber = new Map<string, number>();
+  rows.forEach((r, i) => {
+    const nameKey = resellerKey(r.name);
+    const numberKey = normalizeNumber(r.number);
+    if (nameKey) {
+      const seen = firstByName.get(nameKey);
+      if (seen === undefined) firstByName.set(nameKey, i);
+      else union(seen, i);
+    }
+    if (numberKey) {
+      const seen = firstByNumber.get(numberKey);
+      if (seen === undefined) firstByNumber.set(numberKey, i);
+      else union(seen, i);
+    }
+  });
+
+  const groups = new Map<number, Candidate>();
+  // Rows arrive most-ordered first, so the first name seen in a group is the
+  // one to show and the rest are alternates.
+  rows.forEach((r, i) => {
+    const root = find(i);
+    let g = groups.get(root);
+    if (!g) {
+      g = { name: "", key: "", orders: 0, names: [], spellings: [], numbers: [] };
+      groups.set(root, g);
+    }
+    g.orders += r.orders;
+    const spelling = normalizeName(r.name);
+    if (spelling && !g.spellings.includes(spelling)) {
+      g.spellings.push(spelling);
+      g.names.push(r.name);
+    }
+    const numberKey = normalizeNumber(r.number);
+    if (numberKey && !g.numbers.includes(numberKey)) g.numbers.push(numberKey);
+  });
+
+  return (
+    [...groups.values()]
+      // A group of orders that carry only a phone number has no name to ask for.
+      .filter((g) => g.names.length > 0)
+      .map((g) => ({ ...g, name: g.names[0], key: resellerKey(g.names[0]) }))
+      .sort((a, b) => b.orders - a.orders)
+  );
+}
+
 /** Dice coefficient over character bigrams: 1 = identical, 0 = nothing shared. */
 function dice(a: string, b: string): number {
   if (a === b) return 1;
@@ -209,13 +319,22 @@ export function scoreName(tokens: string[], candidate: string): number {
   return dice(q, c);
 }
 
-/** A reseller name as stored, with how many orders it has. */
+/** One reseller, with every name and number their orders are filed under. */
 export interface Candidate {
-  /** Most common original spelling. */
+  /** The name to show: the one used by the most orders. */
   name: string;
-  /** Comparison key shared by all spellings of this reseller. */
+  /** Comparison key for this reseller. */
   key: string;
   orders: number;
+  /** Every original spelling, most-used first; `name` is the first of them. */
+  names: string[];
+  /**
+   * Every stored spelling, normalized, and every account number. The report
+   * matches on all of them, so no name and no account is left out of the
+   * totals.
+   */
+  spellings: string[];
+  numbers: string[];
 }
 
 /** Minimum score to accept a match without asking the user. */
@@ -230,8 +349,14 @@ export function resolveReseller(
   tokens: string[],
   candidates: Candidate[]
 ): { match?: Candidate; ambiguous: boolean; ranked: Candidate[] } {
+  // Scored against every name the reseller uses, not just the one on show:
+  // "cod corner" has to reach the account whose reports are headed
+  // "Dreams couture".
   const scored = candidates
-    .map((c) => ({ c, score: scoreName(tokens, c.name) }))
+    .map((c) => ({
+      c,
+      score: Math.max(...c.names.map((n) => scoreName(tokens, n))),
+    }))
     .sort((a, b) => b.score - a.score || b.c.orders - a.c.orders);
 
   const best = scored[0];
@@ -269,27 +394,108 @@ interface StatusRow {
 }
 
 /**
- * Orders as the report sees them: the live table plus the archive of finished
- * orders that have been moved out of it. Without the archive a report misses
- * every order that already completed. Deduplicated on order_number, live wins.
+ * The CTE chain every report query opens with, ending in `src`: one row per
+ * order, as the report sees it.
+ *
+ * Three sources feed it. The live table, the archive of finished orders that
+ * have been moved out of it (without which a report misses everything that
+ * already completed), and WooCommerce's list of called-off orders, passed in as
+ * jsonb through `$<wooParam>`.
+ *
+ * That third source does two things SQL alone cannot, both explained in
+ * wooStatus.ts: it corrects orders the importer left sitting at a stale
+ * fulfilment stage, and it adds back the cancelled ones the importer never
+ * brought in. Passing an empty array turns the overlay off and leaves the
+ * database's own numbers untouched.
+ *
+ * Deduplicated on order_number throughout: live beats archive, and WooCommerce
+ * wins on status alone.
  */
-const ORDER_SOURCE = `
-  select o.order_number, o.customer_name, o.customer_phone, o.status, o.total,
-         coalesce(o.line_items, '[]'::jsonb) as line_items,
-         o.created_at, o.reseller_name
-  from public.orders o
-  union all
-  select c.order_data->>'order_number', c.order_data->>'customer_name',
-         c.order_data->>'customer_phone', c.order_data->>'status',
-         nullif(c.order_data->>'total','')::numeric,
-         coalesce(c.order_data->'line_items', '[]'::jsonb),
-         coalesce(nullif(c.order_data->>'created_at','')::timestamptz, c.completed_at),
-         c.order_data->>'reseller_name'
-  from public.completed_orders c
-  where not exists (
-    select 1 from public.orders o2
-    where o2.order_number = c.order_data->>'order_number'
+function orderSourceCte(wooParam: number): string {
+  return `
+  with woo as (
+    select w->>'order_number'                       as order_number,
+           w->>'status'                             as status,
+           nullif(w->>'total','')::numeric          as total,
+           coalesce(w->>'customer_name','')         as customer_name,
+           coalesce(w->>'customer_phone','')        as customer_phone,
+           coalesce(w->>'reseller_name','')         as reseller_name,
+           coalesce(w->>'reseller_number','')       as reseller_number,
+           coalesce(w->'line_items','[]'::jsonb)    as line_items,
+           nullif(w->>'created_at','')::timestamptz as created_at
+    from jsonb_array_elements($${wooParam}::jsonb) w
+  ),
+  stored as (
+    select o.order_number, o.customer_name, o.customer_phone, o.status, o.total,
+           coalesce(o.line_items, '[]'::jsonb) as line_items,
+           o.created_at, o.reseller_name, o.reseller_number
+    from public.orders o
+    union all
+    select c.order_data->>'order_number', c.order_data->>'customer_name',
+           c.order_data->>'customer_phone', c.order_data->>'status',
+           nullif(c.order_data->>'total','')::numeric,
+           coalesce(c.order_data->'line_items', '[]'::jsonb),
+           coalesce(nullif(c.order_data->>'created_at','')::timestamptz, c.completed_at),
+           c.order_data->>'reseller_name',
+           c.order_data->>'reseller_number'
+    from public.completed_orders c
+    where not exists (
+      select 1 from public.orders o2
+      where o2.order_number = c.order_data->>'order_number'
+    )
+  ),
+  src as (
+    -- Stored orders, the called-off status replacing the stale stage. Only the
+    -- status is taken from WooCommerce: the stored row is the better record of
+    -- what was ordered, by whom, for which reseller.
+    select st.order_number, st.customer_name, st.customer_phone,
+           coalesce(w.status, st.status) as status,
+           st.total, st.line_items, st.created_at,
+           st.reseller_name, st.reseller_number
+    from stored st
+    left join woo w on w.order_number = st.order_number
+    union all
+    -- Called-off orders that never reached the database at all.
+    select w.order_number, w.customer_name, w.customer_phone, w.status,
+           w.total, w.line_items, w.created_at,
+           w.reseller_name, w.reseller_number
+    from woo w
+    where not exists (
+      select 1 from stored st2 where st2.order_number = w.order_number
+    )
   )`;
+}
+
+/** SQL twin of normalizeNumber: digits only, country code dropped. */
+const NUMBER_DIGITS_SQL = `regexp_replace(coalesce(s.reseller_number,''), '[^0-9]', '', 'g')`;
+const NORMALIZED_NUMBER_SQL = `
+  case when length(${NUMBER_DIGITS_SQL}) > 10 and ${NUMBER_DIGITS_SQL} like '91%'
+       then right(${NUMBER_DIGITS_SQL}, 10)
+       else ${NUMBER_DIGITS_SQL}
+  end`;
+
+/**
+ * The SQL that picks out one reseller's orders: any name they use, or any
+ * account number they use. The name catches orders filed under their second
+ * shop name, the number catches orders filed under no name at all.
+ *
+ * Parenthesised, because callers AND a period onto it. Names and numbers are
+ * [a-z0-9] only, so these literals are injection-safe.
+ */
+function resellerWhere(c: Candidate): string {
+  const clauses: string[] = [];
+  if (c.spellings.length > 0) {
+    const list = c.spellings.map((s) => `'${s}'`).join(", ");
+    clauses.push(
+      `regexp_replace(lower(s.reseller_name), '[^a-z0-9]+', '', 'g') in (${list})`
+    );
+  }
+  if (c.numbers.length > 0) {
+    const list = c.numbers.map((n) => `'${n}'`).join(", ");
+    clauses.push(`${NORMALIZED_NUMBER_SQL} in (${list})`);
+  }
+  return `(${clauses.join(" or ")})`;
+}
 
 /** SQL and JS spelling of the same rule: which statuses mean "called off". */
 const CANCELLED_SQL = `coalesce(s.status,'') ~* '(cancel|refund|return|fail|reject)'`;
@@ -328,27 +534,35 @@ export async function buildResellerReport(
   const periodLabel = range ? range.label : "All time";
 
   return withClientConnection(connectionString, async (client) => {
-    // Every reseller name in the data, spellings of one name folded together
-    // ("Cod Corner" + "Cod corner"). Matching happens here rather than in SQL
-    // because people run names together and drop words: "dreamcouture" has to
-    // find "Dreams couture", which no LIKE pattern does.
+    // WooCommerce's called-off orders, overlaid on every query below as $1.
+    // Fetched once per report and cached; [] when the store isn't reachable,
+    // which leaves the report exactly as accurate as the database alone.
+    const calledOff = await loadCalledOffOrders(client);
+    const wooJson = JSON.stringify(calledOff);
+
+    // Every (name, number) pairing in the data, folded into one candidate per
+    // reseller. Matching happens here rather than in SQL because people run
+    // names together and drop words: "dreamcouture" has to find "Dreams
+    // couture", which no LIKE pattern does.
     const namesQ = await client.query(
-      `with src as (${ORDER_SOURCE})
-       select s.reseller_name as name, count(*)::int as orders
+      `${orderSourceCte(1)}
+       select coalesce(s.reseller_name,'')   as name,
+              coalesce(s.reseller_number,'') as number,
+              count(*)::int                  as orders
        from src s
-       where s.reseller_name is not null and btrim(s.reseller_name) <> ''
-       group by s.reseller_name order by orders desc`
+       where btrim(coalesce(s.reseller_name,'')) <> ''
+          or btrim(coalesce(s.reseller_number,'')) <> ''
+       group by 1, 2 order by orders desc`,
+      [wooJson]
     );
-    const byKey = new Map<string, Candidate>();
-    for (const r of namesQ.rows) {
-      const key = normalizeName(String(r.name));
-      if (!key) continue;
-      const existing = byKey.get(key);
-      // Keep the spelling used by the most orders as the display name.
-      if (existing) existing.orders += Number(r.orders);
-      else byKey.set(key, { name: String(r.name), key, orders: Number(r.orders) });
-    }
-    const candidates = [...byKey.values()].sort((a, b) => b.orders - a.orders);
+    const candidates = groupResellers(
+      namesQ.rows.map((r) => ({
+        name: String(r.name ?? ""),
+        number: String(r.number ?? ""),
+        orders: Number(r.orders),
+      }))
+    );
+    const byKey = new Map(candidates.map((c) => [c.key, c]));
 
     const resolved = chosenKey
       ? { match: byKey.get(chosenKey), ambiguous: false, ranked: candidates }
@@ -371,14 +585,18 @@ export async function buildResellerReport(
     }
 
     const displayName = resolved.match.name;
-    // The key is [a-z0-9] only, so this literal is injection-safe.
-    const nameWhere = `regexp_replace(lower(s.reseller_name), '[^a-z0-9]+', '', 'g') = '${resolved.match.key}'`;
-    const periodWhere = range ? ` and s.created_at >= $1 and s.created_at < $2` : "";
-    const params: unknown[] = range ? [range.start, range.end] : [];
+    // Every name AND every account number this reseller uses, so none of their
+    // orders is missed: the name catches the ones filed under a second shop
+    // name, the number catches those filed under none at all. Both lists are
+    // [a-z0-9] only, so these literals are injection-safe.
+    const nameWhere = resellerWhere(resolved.match);
+    // $1 is always the WooCommerce overlay; the period, when asked for, is $2/$3.
+    const periodWhere = range ? ` and s.created_at >= $2 and s.created_at < $3` : "";
+    const params: unknown[] = range ? [wooJson, range.start, range.end] : [wooJson];
     const where = nameWhere + periodWhere;
 
     const summaryQ = await client.query(
-      `with src as (${ORDER_SOURCE})
+      `${orderSourceCte(1)}
        select count(*)::int                                          as orders,
               coalesce(sum(s.total),0)                                as amount,
               count(*) filter (where ${CANCELLED_SQL})::int           as cancelled_orders,
@@ -404,7 +622,7 @@ export async function buildResellerReport(
     }
 
     const statusQ = await client.query(
-      `with src as (${ORDER_SOURCE})
+      `${orderSourceCte(1)}
        select coalesce(nullif(btrim(s.status),''),'(none)') as status,
               count(*)::int as orders, coalesce(sum(s.total),0) as amount
        from src s where ${where}
@@ -420,7 +638,7 @@ export async function buildResellerReport(
     // One row per product per order. LEFT JOIN so an order with no line items
     // still appears - it is still one of the reseller's orders.
     const linesQ = await client.query(
-      `with src as (${ORDER_SOURCE})
+      `${orderSourceCte(1)}
        select s.order_number,
               s.created_at,
               btrim(regexp_replace(coalesce(s.customer_name,''), '^\\s*Name\\s*:\\s*', '', 'i')) as customer,
@@ -456,6 +674,9 @@ export async function buildResellerReport(
 
     const data: ReportData = {
       displayName,
+      // The reseller's other shop names, so the report says out loud which
+      // orders it swept in beyond the name that was typed.
+      alsoKnownAs: resolved.match.names.slice(1),
       periodLabel,
       spanText: range
         ? formatRangeSpan(range)
@@ -464,6 +685,9 @@ export async function buildResellerReport(
       totalValue: Number(s.amount),
       cancelledOrders: Number(s.cancelled_orders),
       cancelledValue: Number(s.cancelled_amount),
+      // What the reseller actually owes for: everything that wasn't called off.
+      netOrders: Number(s.orders) - Number(s.cancelled_orders),
+      netValue: Number(s.amount) - Number(s.cancelled_amount),
       statusRows,
       lines,
       truncated,
@@ -475,8 +699,13 @@ export async function buildResellerReport(
       `Date range: ${data.spanText}\n` +
       `Total orders: ${num(data.totalOrders)}\n` +
       `Total order value: ${inr(data.totalValue)}\n` +
+      (data.alsoKnownAs.length > 0
+        ? `Also includes orders placed under: ${data.alsoKnownAs.join(", ")}
+`
+        : "") +
       (data.cancelledOrders > 0
-        ? `Cancelled: ${num(data.cancelledOrders)} order(s), ${inr(data.cancelledValue)}`
+        ? `Cancelled: ${num(data.cancelledOrders)} order(s), ${inr(data.cancelledValue)}\n` +
+          `Net (excluding cancelled): ${num(data.netOrders)} order(s), ${inr(data.netValue)}`
         : `Cancelled: none`) +
       `\n(PDF and CSV attached.)`;
 
@@ -500,12 +729,17 @@ export async function buildResellerReport(
 /** Everything the PDF and CSV renderers need. */
 export interface ReportData {
   displayName: string;
+  /** Other names this reseller's orders are filed under, if any. */
+  alsoKnownAs: string[];
   periodLabel: string;
   spanText: string;
   totalOrders: number;
   totalValue: number;
   cancelledOrders: number;
   cancelledValue: number;
+  /** Total less cancelled: the figure to bill on. */
+  netOrders: number;
+  netValue: number;
   statusRows: StatusRow[];
   lines: LineRow[];
   truncated: boolean;
@@ -571,15 +805,26 @@ export async function buildPdf(d: ReportData): Promise<Buffer> {
     { label: "Total orders", value: num(d.totalOrders) },
     { label: "Total order value", value: inr(d.totalValue) },
     { label: "Cancelled orders", value: num(d.cancelledOrders) },
+    { label: "Net order value", value: inr(d.netValue) },
   ]);
 
-  pdf.totalBar("Total order value", inr(d.totalValue));
+  // The net figure leads: it is the one that gets billed.
+  pdf.totalBar("Net order value (excluding cancelled)", inr(d.netValue));
 
   pdf.section("Summary");
   pdf.keyValues([
     ["Date range", `${d.periodLabel} (${d.spanText})`],
+    ...(d.alsoKnownAs.length > 0
+      ? ([["Names included", [d.displayName, ...d.alsoKnownAs].join(", ")]] as [
+          string,
+          string
+        ][])
+      : []),
     ["Total orders", num(d.totalOrders)],
     ["Total order value", inr(d.totalValue)],
+    ["Cancelled orders", `${num(d.cancelledOrders)} (${inr(d.cancelledValue)})`],
+    ["Net orders", num(d.netOrders)],
+    ["Net order value", inr(d.netValue)],
   ]);
 
   pdf.section("Orders by status");
@@ -599,6 +844,7 @@ export async function buildPdf(d: ReportData): Promise<Buffer> {
         highlight: isCancelled(r.status),
       })),
       { cells: ["TOTAL", num(d.totalOrders), inr(d.totalValue)] },
+      { cells: ["NET (excluding cancelled)", num(d.netOrders), inr(d.netValue)] },
     ]
   );
   pdf.note(
@@ -635,10 +881,17 @@ export function buildCsv(d: ReportData): string {
   lines.push("Summary");
   lines.push(csvRow(["metric", "value"]));
   lines.push(csvRow(["Date range", d.spanText]));
+  if (d.alsoKnownAs.length > 0) {
+    lines.push(
+      csvRow(["Names included", [d.displayName, ...d.alsoKnownAs].join(", ")])
+    );
+  }
   lines.push(csvRow(["Total orders", d.totalOrders]));
   lines.push(csvRow(["Total order value", money(d.totalValue)]));
   lines.push(csvRow(["Cancelled orders", d.cancelledOrders]));
   lines.push(csvRow(["Cancelled order value", money(d.cancelledValue)]));
+  lines.push(csvRow(["Net orders (excluding cancelled)", d.netOrders]));
+  lines.push(csvRow(["Net order value (excluding cancelled)", money(d.netValue)]));
   lines.push("");
   lines.push("Orders by status");
   lines.push(csvRow(["status", "cancelled", "orders", "value"]));
@@ -648,6 +901,7 @@ export function buildCsv(d: ReportData): string {
     );
   }
   lines.push(csvRow(["TOTAL", "", d.totalOrders, money(d.totalValue)]));
+  lines.push(csvRow(["NET (excluding cancelled)", "", d.netOrders, money(d.netValue)]));
   lines.push("");
   lines.push("Order details");
   lines.push(
