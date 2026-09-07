@@ -17,9 +17,11 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@types/pdfkit": "^0.17.6",
     "dotenv": "^16.4.5",
     "grammy": "^1.30.0",
     "openai": "^6.45.0",
+    "pdfkit": "^0.20.2",
     "pg": "^8.13.1"
   },
   "devDependencies": {

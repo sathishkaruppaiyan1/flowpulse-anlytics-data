@@ -18,7 +18,7 @@ import {
 import { simpleAsk } from "./services/simpleAsk.js";
 import { routeToDb } from "./services/dbRouter.js";
 import {
-  isCompleteDetailsRequest,
+  parseReportRequest,
   buildResellerReport,
 } from "./services/resellerReport.js";
 import { renderValues, renderTable, asPre } from "./services/report.js";
@@ -79,6 +79,8 @@ async function main() {
         `Just ask me anything in plain English, e.g.:\n` +
         `- "total sales this month"\n` +
         `- "top 5 customers by orders"\n` +
+        `- "dreamcouture last month orders" (PDF report)\n` +
+        `- "dreamcouture last month orders in pdf and csv" (both files)\n` +
         (multiDb
           ? `\nI answer from ONE database per question. Mention "reseller" to ` +
             `target that store; otherwise I'll ask which one.\n`
@@ -89,7 +91,13 @@ async function main() {
 
   bot.command("help", (ctx) =>
     ctx.reply(
-      `Ask any analytical question in plain English.\n` +
+      `Ask any analytical question in plain English.\n\n` +
+      `Reseller reports: name the reseller and (optionally) a period —\n` +
+      `"dreamcouture last month orders". You get a summary plus a PDF with the\n` +
+      `product details and the overall total value. Add "csv" for a spreadsheet,\n` +
+      `or "pdf and csv" for both.\n` +
+      `Periods I understand: today, yesterday, this/last week, this/last month,\n` +
+      `last 30 days, june 2025, 2025, 2026-01-01 to 2026-03-31.\n\n` +
         (multiDb
           ? `I use one database per question (never combined). Say "reseller" ` +
             `to target the reseller store; otherwise I'll ask which one.\n`
@@ -146,20 +154,33 @@ async function main() {
   // DB if configured, else the only database.
   const reportDb = byKey.get("reseller") ?? databases[0];
 
-  /** Generate a reseller complete-details report: text summary + CSV file. */
-  async function sendResellerReport(ctx: Context, question: string): Promise<void> {
+  /**
+   * Generate a reseller order report: text summary + PDF and/or CSV attachments.
+   * Returns false when no reseller matched, so an implicit request (a name plus
+   * "orders", no "report"/"pdf" wording) can fall back to the normal Q&A flow.
+   */
+  async function sendResellerReport(
+    ctx: Context,
+    question: string,
+    request: ReturnType<typeof parseReportRequest>
+  ): Promise<boolean> {
     await ctx.replyWithChatAction("typing");
     const tag = multiDb ? `[${reportDb.label}] ` : "";
     try {
-      const report = await buildResellerReport(reportDb.conn, question);
+      const report = await buildResellerReport(reportDb.conn, question, request);
+      if (!report.found && !request.explicit) return false;
+
       await ctx.reply(`${tag}${report.summaryText}`);
-      if (report.found && report.csv && report.filename) {
-        await ctx.replyWithDocument(
-          new InputFile(Buffer.from(report.csv, "utf8"), report.filename)
-        );
+      for (const file of report.files) {
+        await ctx.replyWithChatAction("upload_document");
+        await ctx.replyWithDocument(new InputFile(file.data, file.filename));
       }
+      return true;
     } catch (e) {
+      console.error("[simple] report failed:", e);
+      if (!request.explicit) return false;
       await ctx.reply(`${tag}Couldn't build the report: ${(e as Error).message}`);
+      return true;
     }
   }
 
@@ -198,10 +219,13 @@ async function main() {
     const text = ctx.message.text;
     if (text.startsWith("/")) return;
 
-    // "complete details" -> deterministic reseller report (text + CSV).
-    if (isCompleteDetailsRequest(text)) {
-      await sendResellerReport(ctx, text);
-      return;
+    // A named reseller + orders/report/pdf wording -> deterministic report
+    // (text summary + PDF, plus CSV when asked). Implicit requests that match
+    // no reseller fall through to the normal question flow.
+    const reportRequest = parseReportRequest(text);
+    if (reportRequest.isReport) {
+      const handled = await sendResellerReport(ctx, text, reportRequest);
+      if (handled) return;
     }
 
     // Single database: answer directly.

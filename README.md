@@ -53,6 +53,29 @@ After startup, just send a question like:
 - `total sales this month`
 - `top 5 customers by orders`
 
+## Reseller Reports (PDF / CSV)
+
+Name a reseller and (optionally) a period, and the bot replies with a chat
+summary plus a downloadable report instead of a plain answer:
+
+- `dreamcouture last month orders` - summary + **PDF**
+- `dreamcouture last month orders in pdf and csv` - **both** files
+- `dreamcouture june 2025 orders csv` - **CSV** only
+- `minikki complete details` - all-time report
+
+PDF is the default; add `csv` for a spreadsheet, or `pdf and csv` / `both` for
+both. Every report contains the order list, the products in each order, the
+per-product totals, and the overall total value.
+
+Periods understood: `today`, `yesterday`, `this/last week`, `this/last month`,
+`last 30 days`, `june 2025`, `2025`, `2026-01-01 to 2026-03-31`. With no period
+the report covers all time. Period boundaries use `REPORT_TZ_OFFSET`
+(default `+05:30`, IST).
+
+These reports are built from fixed SQL rather than LLM-generated SQL, so the
+totals are reproducible. They run against the reseller database when
+`DATA_DB_URL_RESELLER` is set.
+
 ## How It Works
 
 ```text
@@ -79,6 +102,8 @@ The safety model uses:
 | SQL safety guard | `src/services/sqlGuard.ts` |
 | Read-only executor | `src/services/executor.ts`, `src/services/clientDb.ts` |
 | Schema introspection | `src/services/schemaIntrospect.ts` |
+| Reseller PDF/CSV reports | `src/services/resellerReport.ts`, `src/services/pdf.ts`, `src/services/dateRange.ts` |
+| Report fonts (rupee sign, Tamil) | `assets/fonts/` |
 | Tenant/project store | `src/services/projectStore.ts` |
 | Credential encryption | `src/crypto/vault.ts` |
 
