@@ -30,6 +30,11 @@ export interface ResellerReport {
   summaryText: string;
   /** Generated attachments, in the order they should be sent. */
   files: ReportFile[];
+  /**
+   * Reseller names to offer as a choice when the name didn't match or matched
+   * two resellers equally well.
+   */
+  candidates?: Candidate[];
 }
 
 /** What a message is asking for, once parsed. */
@@ -80,9 +85,14 @@ const REPORT_PHRASE_RE =
 const ORDER_WORDS_RE =
   /\b(orders?|sales?|purchases?|invoices?|details?|report|billing|transactions?)\b/i;
 
-/** Rows pulled into the order list / line-item sections of a report. */
-const ORDER_LIMIT = Math.max(config.queryRowLimit, 500);
-const LINE_ITEM_LIMIT = 5000;
+/**
+ * Rows pulled into the order list / line-item sections. Deliberately far above
+ * QUERY_ROW_LIMIT (which caps ad-hoc LLM queries): a month's orders are the
+ * point of the report, and truncating them silently loses data the user asked
+ * for. The totals are aggregated in SQL, so they stay correct either way.
+ */
+const ORDER_LIMIT = Math.max(config.queryRowLimit, 5000);
+const LINE_ITEM_LIMIT = 20000;
 
 /** Decide whether a message is a report request, and in which formats. */
 export function parseReportRequest(text: string): ReportRequest {
@@ -154,6 +164,94 @@ function slugify(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
 }
 
+/**
+ * Comparison key for a reseller name: lowercase, letters and digits only.
+ * "Dreams couture", "Dreams Couture" and "dreams-couture" all collapse to
+ * "dreamscouture", so spellings of one reseller are counted together.
+ */
+export function normalizeName(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+/** Dice coefficient over character bigrams: 1 = identical, 0 = nothing shared. */
+function dice(a: string, b: string): number {
+  if (a === b) return 1;
+  if (a.length < 2 || b.length < 2) return 0;
+  const bigrams = new Map<string, number>();
+  for (let i = 0; i < a.length - 1; i++) {
+    const g = a.slice(i, i + 2);
+    bigrams.set(g, (bigrams.get(g) ?? 0) + 1);
+  }
+  let hits = 0;
+  for (let i = 0; i < b.length - 1; i++) {
+    const g = b.slice(i, i + 2);
+    const n = bigrams.get(g) ?? 0;
+    if (n > 0) {
+      bigrams.set(g, n - 1);
+      hits++;
+    }
+  }
+  return (2 * hits) / (a.length - 1 + (b.length - 1));
+}
+
+/**
+ * How well a reseller name answers the words the user typed. Typing runs
+ * spellings together ("dreamcouture" for "Dreams couture") and drops generic
+ * words ("shiny" for "Shiny boutique"), so exact containment is not enough.
+ */
+export function scoreName(tokens: string[], candidate: string): number {
+  const c = normalizeName(candidate);
+  const q = normalizeName(tokens.join(""));
+  if (!c || !q) return 0;
+  if (c === q) return 1;
+  // One contains the other: "shiny" -> "shinyboutique".
+  if (c.includes(q) || q.includes(c)) return 0.95;
+  // Every typed word appears somewhere in the name, in any order.
+  const allPresent =
+    tokens.length > 0 && tokens.every((t) => c.includes(normalizeName(t)));
+  if (allPresent) return 0.9;
+  // Otherwise fall back to spelling similarity: "dreamcouture" vs
+  // "dreamscouture" differ by one letter and still have to match.
+  return dice(q, c);
+}
+
+/** A reseller name as stored, with how many orders it has. */
+export interface Candidate {
+  /** Most common original spelling. */
+  name: string;
+  /** Comparison key shared by all spellings of this reseller. */
+  key: string;
+  orders: number;
+}
+
+/** Minimum score to accept a match without asking the user. */
+const MATCH_THRESHOLD = 0.62;
+
+/**
+ * Pick the reseller the user meant. Returns the best match plus the full
+ * candidate list, so the caller can offer a choice when nothing scores well or
+ * two names score alike.
+ */
+export function resolveReseller(
+  tokens: string[],
+  candidates: Candidate[]
+): { match?: Candidate; ambiguous: boolean; ranked: Candidate[] } {
+  const scored = candidates
+    .map((c) => ({ c, score: scoreName(tokens, c.name) }))
+    .sort((a, b) => b.score - a.score || b.c.orders - a.c.orders);
+
+  const best = scored[0];
+  const runnerUp = scored[1];
+  if (!best || best.score < MATCH_THRESHOLD) {
+    return { ambiguous: false, ranked: candidates };
+  }
+  // Two names that fit about equally well - let the user pick.
+  if (runnerUp && runnerUp.score >= MATCH_THRESHOLD && best.score - runnerUp.score < 0.1) {
+    return { ambiguous: true, ranked: scored.map((s) => s.c) };
+  }
+  return { match: best.c, ambiguous: false, ranked: scored.map((s) => s.c) };
+}
+
 interface OrderRow {
   order_number: string;
   created_at: unknown;
@@ -179,10 +277,12 @@ interface ItemRow {
 export async function buildResellerReport(
   connectionString: string,
   question: string,
-  request: ReportRequest = parseReportRequest(question)
+  request: ReportRequest = parseReportRequest(question),
+  /** Skip name matching and report on exactly this reseller (a button tap). */
+  chosenKey?: string
 ): Promise<ResellerReport> {
   const { tokens, range, formats } = request;
-  if (tokens.length === 0) {
+  if (tokens.length === 0 && !chosenKey) {
     return {
       found: false,
       summaryText: 'Which reseller? Try e.g. "dreamcouture last month orders".',
@@ -190,37 +290,56 @@ export async function buildResellerReport(
     };
   }
 
-  // reseller_name lives on public.orders; tokens are safe alphanumerics.
-  const nameWhere = tokens.map((t) => `o.reseller_name ILIKE '%${t}%'`).join(" AND ");
-  const periodWhere = range ? ` and o.created_at >= $1 and o.created_at < $2` : "";
-  const params: unknown[] = range ? [range.start, range.end] : [];
-  const where = nameWhere + periodWhere;
   const periodLabel = range ? range.label : "All time";
 
   return withClientConnection(connectionString, async (client) => {
-    // Does this reseller exist at all (ignoring the period)?
-    const existsQ = await client.query(
-      `select o.reseller_name as name, count(*)::int as c
-       from public.orders o where ${nameWhere}
-       group by o.reseller_name order by c desc limit 1`
+    // Every reseller name in the data, spellings of one name folded together
+    // ("Cod Corner" + "Cod corner"). Matching happens here rather than in SQL
+    // because people run names together and drop words: "dreamcouture" has to
+    // find "Dreams couture", which no LIKE pattern does.
+    const namesQ = await client.query(
+      `select o.reseller_name as name, count(*)::int as orders
+       from public.orders o
+       where o.reseller_name is not null and btrim(o.reseller_name) <> ''
+       group by o.reseller_name order by orders desc`
     );
-    if (existsQ.rows.length === 0) {
-      const names = await client.query(
-        `select o.reseller_name as name, count(*)::int as orders
-         from public.orders o
-         where o.reseller_name is not null
-         group by o.reseller_name order by orders desc limit 15`
-      );
-      const list = names.rows.map((r) => `- ${r.name} (${r.orders})`).join("\n");
+    const byKey = new Map<string, Candidate>();
+    for (const r of namesQ.rows) {
+      const key = normalizeName(String(r.name));
+      if (!key) continue;
+      const existing = byKey.get(key);
+      // Keep the spelling used by the most orders as the display name.
+      if (existing) existing.orders += Number(r.orders);
+      else byKey.set(key, { name: String(r.name), key, orders: Number(r.orders) });
+    }
+    const candidates = [...byKey.values()].sort((a, b) => b.orders - a.orders);
+
+    const resolved = chosenKey
+      ? { match: byKey.get(chosenKey), ambiguous: false, ranked: candidates }
+      : resolveReseller(tokens, candidates);
+
+    if (!resolved.match) {
+      const list = resolved.ranked
+        .slice(0, 15)
+        .map((c) => `- ${c.name} (${c.orders})`)
+        .join("\n");
       return {
         found: false,
-        summaryText:
-          `I couldn't find a reseller matching "${tokens.join(" ")}".\n\n` +
-          `Resellers I do have:\n${list}`,
+        summaryText: resolved.ambiguous
+          ? `More than one reseller matches "${tokens.join(" ")}". Which one?`
+          : `I couldn't find a reseller matching "${tokens.join(" ")}".\n\n` +
+            `Resellers I do have:\n${list}`,
         files: [],
+        candidates: resolved.ranked.slice(0, 15),
       };
     }
-    const displayName: string = existsQ.rows[0].name ?? tokens.join(" ");
+
+    const displayName = resolved.match.name;
+    // The key is [a-z0-9] only, so this literal is injection-safe.
+    const nameWhere = `regexp_replace(lower(o.reseller_name), '[^a-z0-9]+', '', 'g') = '${resolved.match.key}'`;
+    const periodWhere = range ? ` and o.created_at >= $1 and o.created_at < $2` : "";
+    const params: unknown[] = range ? [range.start, range.end] : [];
+    const where = nameWhere + periodWhere;
 
     const summaryQ = await client.query(
       `select count(*)::int                       as orders,
@@ -243,7 +362,7 @@ export async function buildResellerReport(
         summaryText:
           `${displayName} — no orders in ${periodLabel}` +
           (range ? ` (${formatRangeSpan(range)}).` : ".") +
-          `\nTry a different period, e.g. "${tokens[0]} all orders".`,
+          `\nTry a different period, e.g. "${displayName} all orders".`,
         files: [],
       };
     }

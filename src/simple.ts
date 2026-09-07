@@ -20,6 +20,10 @@ import { routeToDb } from "./services/dbRouter.js";
 import {
   parseReportRequest,
   buildResellerReport,
+  extractResellerTokens,
+  resolveReseller,
+  type Candidate,
+  type ReportRequest,
 } from "./services/resellerReport.js";
 import { renderValues, renderTable, asPre } from "./services/report.js";
 
@@ -50,6 +54,19 @@ async function main() {
 
   // Pending question per chat, awaiting a "which database?" button tap.
   const pending = new Map<number, string>();
+
+  /**
+   * A report whose reseller name didn't match, per chat. Keeping the period and
+   * the requested formats means the follow-up — a button tap or just typing the
+   * name — produces the report that was originally asked for.
+   */
+  interface PendingReport {
+    request: ReportRequest;
+    candidates: Candidate[];
+    at: number;
+  }
+  const pendingReports = new Map<number, PendingReport>();
+  const PENDING_REPORT_TTL_MS = 15 * 60_000;
 
   async function loadSchemas(): Promise<void> {
     for (const db of databases) {
@@ -162,14 +179,40 @@ async function main() {
   async function sendResellerReport(
     ctx: Context,
     question: string,
-    request: ReturnType<typeof parseReportRequest>
+    request: ReportRequest,
+    chosenKey?: string
   ): Promise<boolean> {
     await ctx.replyWithChatAction("typing");
     const tag = multiDb ? `[${reportDb.label}] ` : "";
+    const chatId = ctx.chat?.id;
     try {
-      const report = await buildResellerReport(reportDb.conn, question, request);
-      if (!report.found && !request.explicit) return false;
+      const report = await buildResellerReport(
+        reportDb.conn,
+        question,
+        request,
+        chosenKey
+      );
+      if (!report.found && !request.explicit && !chosenKey) return false;
 
+      // No match: remember what was asked and offer the names as buttons, so
+      // the user picks instead of retyping the whole request.
+      if (!report.found && report.candidates?.length && chatId != null) {
+        pendingReports.set(chatId, {
+          request,
+          candidates: report.candidates,
+          at: Date.now(),
+        });
+        const kb = new InlineKeyboard();
+        report.candidates.slice(0, 8).forEach((c, i) => {
+          kb.text(`${c.name} (${c.orders})`, `rp:${i}`).row();
+        });
+        await ctx.reply(`${tag}${report.summaryText}\n\nPick one:`, {
+          reply_markup: kb,
+        });
+        return true;
+      }
+
+      if (chatId != null) pendingReports.delete(chatId);
       await ctx.reply(`${tag}${report.summaryText}`);
       for (const file of report.files) {
         await ctx.replyWithChatAction("upload_document");
@@ -178,7 +221,7 @@ async function main() {
       return true;
     } catch (e) {
       console.error("[simple] report failed:", e);
-      if (!request.explicit) return false;
+      if (!request.explicit && !chosenKey) return false;
       await ctx.reply(`${tag}Couldn't build the report: ${(e as Error).message}`);
       return true;
     }
@@ -196,6 +239,22 @@ async function main() {
   // Button tap: resolve the pending question against the chosen database.
   bot.on("callback_query:data", async (ctx) => {
     const data = ctx.callbackQuery.data;
+
+    // Reseller pick for a report whose name didn't match.
+    if (data.startsWith("rp:")) {
+      const chatId = ctx.chat?.id;
+      const pend = chatId != null ? pendingReports.get(chatId) : undefined;
+      const picked = pend?.candidates[Number(data.slice(3))];
+      await ctx.answerCallbackQuery();
+      if (!pend || !picked) {
+        await ctx.editMessageText("That request expired — please ask again.");
+        return;
+      }
+      await ctx.editMessageText(`Building the ${picked.name} report...`);
+      await sendResellerReport(ctx, picked.name, pend.request, picked.key);
+      return;
+    }
+
     if (!data.startsWith("db:")) {
       await ctx.answerCallbackQuery();
       return;
@@ -226,6 +285,25 @@ async function main() {
     if (reportRequest.isReport) {
       const handled = await sendResellerReport(ctx, text, reportRequest);
       if (handled) return;
+    }
+
+    // Just the reseller's name after a report we couldn't match ("Dreams
+    // couture"): finish that report rather than treating it as a new question.
+    // Only when the name actually matches one of the offered candidates, so
+    // ordinary questions still go to the normal flow.
+    const chatId = ctx.chat?.id;
+    const pend = chatId != null ? pendingReports.get(chatId) : undefined;
+    if (pend && Date.now() - pend.at < PENDING_REPORT_TTL_MS) {
+      const picked = resolveReseller(
+        extractResellerTokens(text),
+        pend.candidates
+      ).match;
+      if (picked) {
+        await sendResellerReport(ctx, text, pend.request, picked.key);
+        return;
+      }
+    } else if (pend && chatId != null) {
+      pendingReports.delete(chatId);
     }
 
     // Single database: answer directly.

@@ -184,7 +184,11 @@ query result rows (JSON), write a concise, friendly answer for a Telegram chat.
 Rules:
 - Lead with the direct answer / key number.
 - Add 1-2 short insights if the data supports them (trends, comparisons).
-- Keep it under ~120 words. Use simple formatting, no markdown tables.
+- Keep it under ~120 words.
+- Plain text only. The chat does not render markdown, so never use *, **, #,
+  backticks or tables - asterisks show up literally.
+- Money is Indian rupees: write amounts as ₹1,28,040 (Indian digit grouping).
+  Never use a dollar sign.
 - Never invent numbers not present in the data.`;
 
 /** Turn query results into a plain-English answer with light insight. */
