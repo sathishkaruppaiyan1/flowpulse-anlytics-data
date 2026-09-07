@@ -56,16 +56,33 @@ After startup, just send a question like:
 ## Reseller Reports (PDF / CSV)
 
 Name a reseller and (optionally) a period, and the bot replies with a chat
-summary plus a downloadable report instead of a plain answer:
+summary plus **both a PDF and a CSV** - no need to ask for a format:
 
-- `dreamcouture last month orders` - summary + **PDF**
-- `dreamcouture last month orders in pdf and csv` - **both** files
-- `dreamcouture june 2025 orders csv` - **CSV** only
-- `minikki complete details` - all-time report
+- `dreamcouture last month orders`
+- `minikki complete details`
+- `shiny june 2025 orders`
 
-PDF is the default; add `csv` for a spreadsheet, or `pdf and csv` / `both` for
-both. Every report contains the order list, the products in each order, the
-per-product totals, and the overall total value.
+Reseller names are matched fuzzily, so `dreamcouture` finds `Dreams couture`,
+and spellings of one reseller (`Cod Corner` / `Cod corner`) are counted as one.
+When the name is unclear the bot offers the known names as buttons.
+
+Each report contains:
+
+- **Summary** - date range, total order count, total order value
+- **Orders by status** - counts and value per status, cancelled ones flagged
+- **Order details** - one row per product per order: S.No, order ID, product
+  photo, product, customer name, customer phone, size / qty, price, status
+- **Cancelled orders** - the cancelled ones again on their own, when there are any
+
+Cancelled orders (status matching cancel / refund / return / failed / rejected)
+are highlighted in red in the PDF and carry a `cancelled` column in the CSV.
+
+Orders are read from `public.orders` **union** `public.completed_orders`, since
+finished orders are moved into that archive and a report reading only the live
+table silently loses them.
+
+Product photos are downscaled to thumbnails and cached on disk, so a report of
+900 orders fetches roughly 90 distinct images once and reuses them.
 
 Periods understood: `today`, `yesterday`, `this/last week`, `this/last month`,
 `last 30 days`, `june 2025`, `2025`, `2026-01-01 to 2026-03-31`. With no period
@@ -103,6 +120,7 @@ The safety model uses:
 | Read-only executor | `src/services/executor.ts`, `src/services/clientDb.ts` |
 | Schema introspection | `src/services/schemaIntrospect.ts` |
 | Reseller PDF/CSV reports | `src/services/resellerReport.ts`, `src/services/pdf.ts`, `src/services/dateRange.ts` |
+| Product photo thumbnails | `src/services/productImages.ts` |
 | Report fonts (rupee sign, Tamil) | `assets/fonts/` |
 | Tenant/project store | `src/services/projectStore.ts` |
 | Credential encryption | `src/crypto/vault.ts` |

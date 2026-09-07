@@ -32,14 +32,29 @@ const HEAD_BG = "#1f2937";
 const ZEBRA = "#f6f7f9";
 const ACCENT = "#0f766e";
 
+const DANGER = "#b91c1c";
+const DANGER_BG = "#fee2e2";
+
+/** Side of the square a product photo is fitted into, in points. */
+const IMAGE_BOX = 34;
+
 export interface Column {
   header: string;
   /** Relative weight; widths are shared out across the content area. */
   width: number;
   align?: "left" | "right";
+  /** Render the cell as a product photo instead of text. */
+  image?: boolean;
 }
 
-export type Cell = string | number | null | undefined;
+/** A table cell: text, or a JPEG/PNG buffer for an image column. */
+export type Cell = string | number | null | undefined | Buffer;
+
+/** One table row, optionally flagged so it stands out (cancelled orders). */
+export interface Row {
+  cells: Cell[];
+  highlight?: boolean;
+}
 
 /** Builds one report PDF. Call the section helpers in order, then `finish()`. */
 export class PdfReport {
@@ -47,9 +62,15 @@ export class PdfReport {
   private chunks: Buffer[] = [];
   private done: Promise<Buffer>;
 
-  constructor() {
+  // Images already embedded, so one photo used by 200 rows is stored once.
+  // pdfkit's typings omit openImage(), but image() accepts what it returns and
+  // embeds it a single time.
+  private imageCache = new Map<string, unknown>();
+
+  constructor(opts: { landscape?: boolean } = {}) {
     this.doc = new PDFDocument({
       size: "A4",
+      layout: opts.landscape ? "landscape" : "portrait",
       margins: { top: 44, bottom: 52, left: 40, right: 40 },
       bufferPages: true,
       autoFirstPage: true,
@@ -81,13 +102,74 @@ export class PdfReport {
     return this.doc.font(TAMIL_RE.test(text) ? "tamil" : bold ? "bold" : "body");
   }
 
+  /**
+   * Draw text, surviving a font-shaping crash on one odd string. fontkit throws
+   * on certain glyph sequences; one bad customer name must not cost the whole
+   * report, so we retry without the marks it choked on and then give up on that
+   * cell alone.
+   */
+  private write(
+    text: string,
+    bold: boolean,
+    x: number,
+    y: number,
+    options: PDFKit.Mixins.TextOptions
+  ): void {
+    try {
+      this.use(text, bold).text(text, x, y, options);
+      return;
+    } catch (e) {
+      console.error(
+        `[pdf] shaping failed for ${JSON.stringify(text.slice(0, 40))}:`,
+        (e as Error).message
+      );
+    }
+    try {
+      const plain = text.normalize("NFKD").replace(/[̀-ͯ]/g, "");
+      this.doc.font(bold ? "bold" : "body").text(plain, x, y, options);
+    } catch {
+      // Leave the cell blank rather than abandoning the document.
+    }
+  }
+
+  /** Height of a wrapped string, tolerating the same shaping failures. */
+  private measure(text: string, width: number): number {
+    try {
+      return this.doc.heightOfString(text, { width });
+    } catch {
+      return this.doc.currentLineHeight();
+    }
+  }
+
+  /**
+   * Draw a product photo, fitted into a square box. The same buffer is embedded
+   * once however many rows use it - reports repeat a handful of photos across
+   * hundreds of rows, and re-embedding each time would bloat the file.
+   */
+  private drawImage(data: Buffer, x: number, y: number): void {
+    try {
+      const key = data.length + ":" + data.subarray(0, 24).toString("base64");
+      let img = this.imageCache.get(key);
+      if (!img) {
+        img = (this.doc as unknown as {
+          openImage(src: Buffer): unknown;
+        }).openImage(data);
+        this.imageCache.set(key, img);
+      }
+      this.doc.image(img as Buffer, x, y, { fit: [IMAGE_BOX, IMAGE_BOX] });
+    } catch {
+      // A corrupt image must not sink the whole report.
+    }
+  }
+
   /** Start a new page when `needed` points would not fit on the current one. */
   private ensure(needed: number): void {
     if (this.doc.y + needed > this.bottom) this.doc.addPage();
   }
 
   title(main: string, subtitle?: string, meta?: string): this {
-    this.use(main, true).fontSize(20).fillColor(INK).text(main, this.left, this.doc.y);
+    this.use(main, true).fontSize(20).fillColor(INK);
+    this.write(main, true, this.left, this.doc.y, { width: this.contentWidth });
     if (subtitle) {
       this.doc.moveDown(0.25);
       this.use(subtitle).fontSize(11).fillColor(ACCENT).text(subtitle);
@@ -128,10 +210,11 @@ export class PdfReport {
           width: boxW - 20,
           lineBreak: false,
         });
-      this.use(it.value, true)
-        .fontSize(14)
-        .fillColor(INK)
-        .text(it.value, x + 10, top + 24, { width: boxW - 20, lineBreak: false });
+      this.use(it.value, true).fontSize(14).fillColor(INK);
+      this.write(it.value, true, x + 10, top + 24, {
+        width: boxW - 20,
+        lineBreak: false,
+      });
     });
 
     this.doc.y = top + boxH + 16;
@@ -172,13 +255,11 @@ export class PdfReport {
         .fontSize(9.5)
         .fillColor(MUTED)
         .text(k, this.left, y, { width: labelW, lineBreak: false });
-      this.use(v, true)
-        .fontSize(9.5)
-        .fillColor(INK)
-        .text(v, this.left + labelW, y, {
-          width: this.contentWidth - labelW,
-          lineBreak: false,
-        });
+      this.use(v, true).fontSize(9.5).fillColor(INK);
+      this.write(v, true, this.left + labelW, y, {
+        width: this.contentWidth - labelW,
+        lineBreak: false,
+      });
       this.doc.y = y + 15;
     }
     this.doc.moveDown(0.3);
@@ -190,8 +271,15 @@ export class PdfReport {
    * A table with a repeating header row. Cells are rendered as text; numbers are
    * stringified by the caller so formatting stays in one place.
    */
-  table(columns: Column[], rows: Cell[][], opts: { zebra?: boolean } = {}): this {
+  table(
+    columns: Column[],
+    rows: (Cell[] | Row)[],
+    opts: { zebra?: boolean } = {}
+  ): this {
     const zebra = opts.zebra ?? true;
+    const normalized: Row[] = rows.map((r) =>
+      Array.isArray(r) ? { cells: r } : r
+    );
     const totalWeight = columns.reduce((a, c) => a + c.width, 0);
     const widths = columns.map((c) => (c.width / totalWeight) * this.contentWidth);
     const padX = 6;
@@ -221,14 +309,21 @@ export class PdfReport {
 
     drawHeader();
 
-    rows.forEach((row, r) => {
-      const texts = row.map((v) => (v === null || v === undefined ? "" : String(v)));
-      // Row height is driven by the tallest wrapped cell.
+    normalized.forEach((row, r) => {
+      const hasImage = row.cells.some(
+        (v, i) => columns[i]?.image && Buffer.isBuffer(v)
+      );
+      const texts = row.cells.map((v, i) =>
+        columns[i]?.image || v === null || v === undefined ? "" : String(v)
+      );
+      // Row height is driven by the tallest wrapped cell, or the photo.
       const heights = texts.map((t, i) => {
+        if (!t) return 0;
         this.use(t).fontSize(fontSize);
-        return this.doc.heightOfString(t, { width: widths[i] - padX * 2 });
+        return this.measure(t, widths[i] - padX * 2);
       });
-      const rowH = Math.max(16, Math.max(...heights, 0) + 7);
+      const textH = Math.max(16, Math.max(...heights, 0) + 7);
+      const rowH = hasImage ? Math.max(textH, IMAGE_BOX + 6) : textH;
 
       if (this.doc.y + rowH > this.bottom) {
         this.doc.addPage();
@@ -236,14 +331,24 @@ export class PdfReport {
       }
 
       const y = this.doc.y;
-      if (zebra && r % 2 === 1) {
+      if (row.highlight) {
+        this.doc.rect(this.left, y, this.contentWidth, rowH).fillColor(DANGER_BG).fill();
+      } else if (zebra && r % 2 === 1) {
         this.doc.rect(this.left, y, this.contentWidth, rowH).fillColor(ZEBRA).fill();
       }
       let x = this.left;
-      texts.forEach((t, i) => {
-        this.use(t).fontSize(fontSize).fillColor(INK).text(t, x + padX, y + 4, {
+      row.cells.forEach((value, i) => {
+        const col = columns[i];
+        if (col?.image) {
+          if (Buffer.isBuffer(value)) this.drawImage(value, x + padX, y + 3);
+          x += widths[i];
+          return;
+        }
+        const t = texts[i];
+        this.use(t).fontSize(fontSize).fillColor(row.highlight ? DANGER : INK);
+        this.write(t, false, x + padX, y + (rowH - (heights[i] || fontSize)) / 2, {
           width: widths[i] - padX * 2,
-          align: columns[i].align ?? "left",
+          align: col?.align ?? "left",
         });
         x += widths[i];
       });

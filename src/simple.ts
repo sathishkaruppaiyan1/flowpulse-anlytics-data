@@ -96,8 +96,7 @@ async function main() {
         `Just ask me anything in plain English, e.g.:\n` +
         `- "total sales this month"\n` +
         `- "top 5 customers by orders"\n` +
-        `- "dreamcouture last month orders" (PDF report)\n` +
-        `- "dreamcouture last month orders in pdf and csv" (both files)\n` +
+        `- "dreamcouture last month orders" (PDF + CSV report)\n` +
         (multiDb
           ? `\nI answer from ONE database per question. Mention "reseller" to ` +
             `target that store; otherwise I'll ask which one.\n`
@@ -110,9 +109,9 @@ async function main() {
     ctx.reply(
       `Ask any analytical question in plain English.\n\n` +
       `Reseller reports: name the reseller and (optionally) a period —\n` +
-      `"dreamcouture last month orders". You get a summary plus a PDF with the\n` +
-      `product details and the overall total value. Add "csv" for a spreadsheet,\n` +
-      `or "pdf and csv" for both.\n` +
+      `"dreamcouture last month orders". You always get both a PDF and a CSV,\n` +
+      `listing every order with its product photo, customer name and phone,\n` +
+      `size/qty, price and status. Cancelled orders are highlighted in red.\n` +
       `Periods I understand: today, yesterday, this/last week, this/last month,\n` +
       `last 30 days, june 2025, 2025, 2026-01-01 to 2026-03-31.\n\n` +
         (multiDb

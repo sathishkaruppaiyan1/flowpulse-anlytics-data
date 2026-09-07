@@ -1,12 +1,11 @@
-// Reseller order report: a chat summary plus downloadable PDF and/or CSV files
-// covering the orders, the products in them, and the overall total value.
+// Reseller order report: a chat summary plus a PDF and a CSV, always both,
+// listing every order line with its product photo, customer, size/qty, price
+// and status - with cancelled orders highlighted.
 //
 // This is a deterministic, code-driven report (not LLM SQL) so the numbers are
-// always consistent. Reseller data lives in public.orders.reseller_name /
-// public.orders.total; the resellers table is config-only and often empty.
-//
-// "dreamcouture last month orders"  -> PDF (default)
-// "dreamcouture last month orders in pdf and csv" -> both files
+// always consistent. Orders come from public.orders UNION the archive in
+// public.completed_orders, because orders are moved out of the live table once
+// they finish and a report that reads only public.orders silently loses them.
 
 import { withClientConnection } from "./clientDb.js";
 import { config } from "../config.js";
@@ -16,7 +15,8 @@ import {
   PERIOD_WORDS,
   type DateRange,
 } from "./dateRange.js";
-import { PdfReport, type Column } from "./pdf.js";
+import { PdfReport, type Column, type Row as PdfRow } from "./pdf.js";
+import { loadThumbnails } from "./productImages.js";
 
 export interface ReportFile {
   filename: string;
@@ -46,7 +46,6 @@ export interface ReportRequest {
    * "orders") fall back to the normal question flow when no reseller matches.
    */
   explicit: boolean;
-  formats: { pdf: boolean; csv: boolean };
   range: DateRange | null;
   /** Distinctive words to match a reseller name by. */
   tokens: string[];
@@ -86,33 +85,28 @@ const ORDER_WORDS_RE =
   /\b(orders?|sales?|purchases?|invoices?|details?|report|billing|transactions?)\b/i;
 
 /**
- * Rows pulled into the order list / line-item sections. Deliberately far above
+ * Order lines pulled into the detail table. Deliberately far above
  * QUERY_ROW_LIMIT (which caps ad-hoc LLM queries): a month's orders are the
  * point of the report, and truncating them silently loses data the user asked
  * for. The totals are aggregated in SQL, so they stay correct either way.
  */
-const ORDER_LIMIT = Math.max(config.queryRowLimit, 5000);
-const LINE_ITEM_LIMIT = 20000;
+const LINE_ITEM_LIMIT = Math.max(config.queryRowLimit, 20000);
 
-/** Decide whether a message is a report request, and in which formats. */
+/**
+ * Decide whether a message is a report request. Format words ("pdf", "csv") are
+ * only a signal that a report is wanted - both files are always produced.
+ */
 export function parseReportRequest(text: string): ReportRequest {
   const tokens = extractResellerTokens(text);
   const phrase = REPORT_PHRASE_RE.test(text);
   const format = FORMAT_RE.test(text);
   const named = tokens.length > 0;
 
-  const wantsCsv = /\b(csv|excel|spreadsheet)\b/i.test(text);
-  const wantsPdf = /\bpdf\b/i.test(text);
-  const wantsBoth = /\bboth\b/i.test(text) || (wantsCsv && wantsPdf);
-
   return {
     // A bare "send it as pdf" with no name isn't a reseller report — let the
     // normal question flow handle it.
     isReport: phrase || (named && (format || ORDER_WORDS_RE.test(text))),
     explicit: phrase || (named && (format || /\breports?\b/i.test(text))),
-    formats: wantsBoth
-      ? { pdf: true, csv: true }
-      : { pdf: !wantsCsv, csv: wantsCsv },
     range: parseDateRange(text),
     tokens,
   };
@@ -252,27 +246,68 @@ export function resolveReseller(
   return { match: best.c, ambiguous: false, ranked: scored.map((s) => s.c) };
 }
 
-interface OrderRow {
+/** One order line: an order joined to one of the products in it. */
+interface LineRow {
   order_number: string;
   created_at: unknown;
-  total: unknown;
-  status: string;
   customer: string;
-  items: number;
-}
-interface ItemRow {
-  order_number: string;
+  phone: string;
+  status: string;
+  order_total: unknown;
   product: string;
+  size: string;
   qty: number;
   price: number;
   line_total: number;
+  image: string;
+}
+
+interface StatusRow {
+  status: string;
+  orders: number;
+  amount: number;
+}
+
+/**
+ * Orders as the report sees them: the live table plus the archive of finished
+ * orders that have been moved out of it. Without the archive a report misses
+ * every order that already completed. Deduplicated on order_number, live wins.
+ */
+const ORDER_SOURCE = `
+  select o.order_number, o.customer_name, o.customer_phone, o.status, o.total,
+         coalesce(o.line_items, '[]'::jsonb) as line_items,
+         o.created_at, o.reseller_name
+  from public.orders o
+  union all
+  select c.order_data->>'order_number', c.order_data->>'customer_name',
+         c.order_data->>'customer_phone', c.order_data->>'status',
+         nullif(c.order_data->>'total','')::numeric,
+         coalesce(c.order_data->'line_items', '[]'::jsonb),
+         coalesce(nullif(c.order_data->>'created_at','')::timestamptz, c.completed_at),
+         c.order_data->>'reseller_name'
+  from public.completed_orders c
+  where not exists (
+    select 1 from public.orders o2
+    where o2.order_number = c.order_data->>'order_number'
+  )`;
+
+/** SQL and JS spelling of the same rule: which statuses mean "called off". */
+const CANCELLED_SQL = `coalesce(s.status,'') ~* '(cancel|refund|return|fail|reject)'`;
+export function isCancelled(status: string | null | undefined): boolean {
+  return /cancel|refund|return|fail|reject/i.test(status ?? "");
+}
+
+/** Status as shown in reports: flagged unless the word already says so. */
+function statusLabel(status: string): string {
+  if (!isCancelled(status) || /cancel/i.test(status)) return status;
+  return `${status} (CANCELLED)`;
 }
 
 /**
  * Build a report for the reseller named in `question`, over the period it
  * mentions ("last month", "june 2025", ... ; all time when it mentions none).
- * Matches reseller_name by ANDing the distinctive tokens (injection-safe: tokens
- * are [a-z0-9]+). Returns found:false with a helpful summary if no match.
+ * Always produces both a PDF and a CSV. Returns found:false with the candidate
+ * names when the reseller can't be identified.
  */
 export async function buildResellerReport(
   connectionString: string,
@@ -281,7 +316,7 @@ export async function buildResellerReport(
   /** Skip name matching and report on exactly this reseller (a button tap). */
   chosenKey?: string
 ): Promise<ResellerReport> {
-  const { tokens, range, formats } = request;
+  const { tokens, range } = request;
   if (tokens.length === 0 && !chosenKey) {
     return {
       found: false,
@@ -298,10 +333,11 @@ export async function buildResellerReport(
     // because people run names together and drop words: "dreamcouture" has to
     // find "Dreams couture", which no LIKE pattern does.
     const namesQ = await client.query(
-      `select o.reseller_name as name, count(*)::int as orders
-       from public.orders o
-       where o.reseller_name is not null and btrim(o.reseller_name) <> ''
-       group by o.reseller_name order by orders desc`
+      `with src as (${ORDER_SOURCE})
+       select s.reseller_name as name, count(*)::int as orders
+       from src s
+       where s.reseller_name is not null and btrim(s.reseller_name) <> ''
+       group by s.reseller_name order by orders desc`
     );
     const byKey = new Map<string, Candidate>();
     for (const r of namesQ.rows) {
@@ -336,20 +372,20 @@ export async function buildResellerReport(
 
     const displayName = resolved.match.name;
     // The key is [a-z0-9] only, so this literal is injection-safe.
-    const nameWhere = `regexp_replace(lower(o.reseller_name), '[^a-z0-9]+', '', 'g') = '${resolved.match.key}'`;
-    const periodWhere = range ? ` and o.created_at >= $1 and o.created_at < $2` : "";
+    const nameWhere = `regexp_replace(lower(s.reseller_name), '[^a-z0-9]+', '', 'g') = '${resolved.match.key}'`;
+    const periodWhere = range ? ` and s.created_at >= $1 and s.created_at < $2` : "";
     const params: unknown[] = range ? [range.start, range.end] : [];
     const where = nameWhere + periodWhere;
 
     const summaryQ = await client.query(
-      `select count(*)::int                       as orders,
-              coalesce(sum(o.total),0)            as amount,
-              coalesce(avg(o.total),0)            as avg_order,
-              count(distinct o.customer_name)::int as customers,
-              min(o.created_at)                   as first_order,
-              max(o.created_at)                   as last_order
-       from public.orders o
-       where ${where}`,
+      `with src as (${ORDER_SOURCE})
+       select count(*)::int                                          as orders,
+              coalesce(sum(s.total),0)                                as amount,
+              count(*) filter (where ${CANCELLED_SQL})::int           as cancelled_orders,
+              coalesce(sum(s.total) filter (where ${CANCELLED_SQL}),0) as cancelled_amount,
+              min(s.created_at)                                       as first_order,
+              max(s.created_at)                                       as last_order
+       from src s where ${where}`,
       params
     );
     const s = summaryQ.rows[0];
@@ -368,325 +404,278 @@ export async function buildResellerReport(
     }
 
     const statusQ = await client.query(
-      `select coalesce(o.status,'(none)') as status,
-              count(*)::int as orders, coalesce(sum(o.total),0) as amount
-       from public.orders o where ${where}
-       group by o.status order by orders desc`,
+      `with src as (${ORDER_SOURCE})
+       select coalesce(nullif(btrim(s.status),''),'(none)') as status,
+              count(*)::int as orders, coalesce(sum(s.total),0) as amount
+       from src s where ${where}
+       group by 1 order by orders desc`,
       params
     );
+    const statusRows: StatusRow[] = statusQ.rows.map((r) => ({
+      status: String(r.status),
+      orders: Number(r.orders),
+      amount: Number(r.amount),
+    }));
 
-    const productsQ = await client.query(
-      `select elem->>'name' as product,
-              sum(coalesce((elem->>'quantity')::numeric,0)) as units,
-              sum(coalesce((elem->>'total')::numeric,0))    as revenue,
-              count(distinct o.order_number)::int            as orders
-       from public.orders o
-       cross join lateral jsonb_array_elements(coalesce(o.line_items,'[]'::jsonb)) as elem
-       where ${where}
-       group by elem->>'name' order by revenue desc`,
-      params
-    );
-
-    const ordersQ = await client.query(
-      `select o.order_number, o.created_at, o.total, coalesce(o.status,'') as status,
-              btrim(regexp_replace(coalesce(o.customer_name,''), '^\\s*Name\\s*:\\s*', '', 'i')) as customer,
-              coalesce(jsonb_array_length(coalesce(o.line_items,'[]'::jsonb)),0)::int as items
-       from public.orders o where ${where}
-       order by o.created_at desc limit ${ORDER_LIMIT}`,
-      params
-    );
-    const orders = ordersQ.rows as OrderRow[];
-
-    const itemsQ = await client.query(
-      `select o.order_number,
-              elem->>'name'                                as product,
+    // One row per product per order. LEFT JOIN so an order with no line items
+    // still appears - it is still one of the reseller's orders.
+    const linesQ = await client.query(
+      `with src as (${ORDER_SOURCE})
+       select s.order_number,
+              s.created_at,
+              btrim(regexp_replace(coalesce(s.customer_name,''), '^\\s*Name\\s*:\\s*', '', 'i')) as customer,
+              coalesce(s.customer_phone,'')                as phone,
+              coalesce(nullif(btrim(s.status),''),'')      as status,
+              s.total                                      as order_total,
+              coalesce(elem->>'name','')                   as product,
+              coalesce(elem->>'size','')                   as size,
               coalesce((elem->>'quantity')::numeric,0)     as qty,
               coalesce((elem->>'price')::numeric,0)        as price,
-              coalesce((elem->>'total')::numeric,0)        as line_total
-       from (
-         select * from public.orders o where ${where}
-         order by o.created_at desc limit ${ORDER_LIMIT}
-       ) o
-       cross join lateral jsonb_array_elements(coalesce(o.line_items,'[]'::jsonb)) as elem
-       order by o.created_at desc limit ${LINE_ITEM_LIMIT}`,
+              coalesce((elem->>'total')::numeric,0)        as line_total,
+              coalesce(elem->>'image','')                  as image
+       from src s
+       left join lateral jsonb_array_elements(s.line_items)
+            with ordinality as t(elem, ord) on true
+       where ${where}
+       order by s.created_at desc, s.order_number desc, t.ord
+       limit ${LINE_ITEM_LIMIT}`,
       params
     );
-    const items = itemsQ.rows as ItemRow[];
+    const lines = linesQ.rows as LineRow[];
 
-    const itemsByOrder = new Map<string, ItemRow[]>();
-    for (const it of items) {
-      const list = itemsByOrder.get(it.order_number);
-      if (list) list.push(it);
-      else itemsByOrder.set(it.order_number, [it]);
+    const distinctOrders = new Set(lines.map((l) => l.order_number)).size;
+    const truncated = distinctOrders < Number(s.orders);
+
+    // Product photos: one fetch per distinct URL, cached across reports.
+    let thumbs = new Map<string, Buffer>();
+    try {
+      thumbs = await loadThumbnails(lines.map((l) => l.image).filter(Boolean));
+    } catch (e) {
+      console.error("[report] thumbnails failed:", e);
     }
 
-    const totalUnits = productsQ.rows.reduce((a, r) => a + Number(r.units || 0), 0);
-    const spanText = range ? formatRangeSpan(range) : `${ymd(s.first_order)} to ${ymd(s.last_order)}`;
-    const truncated = Number(s.orders) > orders.length;
+    const data: ReportData = {
+      displayName,
+      periodLabel,
+      spanText: range
+        ? formatRangeSpan(range)
+        : `${ymd(s.first_order)} to ${ymd(s.last_order)}`,
+      totalOrders: Number(s.orders),
+      totalValue: Number(s.amount),
+      cancelledOrders: Number(s.cancelled_orders),
+      cancelledValue: Number(s.cancelled_amount),
+      statusRows,
+      lines,
+      truncated,
+      thumbs,
+    };
 
-    // ----- chat summary -----
-    const top = productsQ.rows[0];
     const summaryText =
       `${displayName} — ${periodLabel}\n` +
-      `Total orders: ${s.orders}\n` +
-      `Overall total value: ${inr(s.amount)}\n` +
-      `Average order: ${inr(s.avg_order)} | Units sold: ${num(totalUnits)}\n` +
-      `Period: ${spanText}\n` +
-      (top
-        ? `Top product: ${top.product} (${num(top.units)} units, ${inr(top.revenue)})`
-        : "Top product: (none)");
+      `Date range: ${data.spanText}\n` +
+      `Total orders: ${num(data.totalOrders)}\n` +
+      `Total order value: ${inr(data.totalValue)}\n` +
+      (data.cancelledOrders > 0
+        ? `Cancelled: ${num(data.cancelledOrders)} order(s), ${inr(data.cancelledValue)}`
+        : `Cancelled: none`) +
+      `\n(PDF and CSV attached.)`;
 
-    // ----- files -----
-    const base = `${slugify(displayName) || "reseller"}_${slugify(periodLabel) || "all_time"}_report`;
-    const files: ReportFile[] = [];
+    const base = `${slugify(displayName) || "reseller"}_${
+      slugify(periodLabel) || "all_time"
+    }_report`;
 
-    if (formats.pdf) {
-      const pdf = await buildPdf({
-        displayName,
-        periodLabel,
-        spanText,
-        summary: s,
-        totalUnits,
-        statusRows: statusQ.rows,
-        productRows: productsQ.rows,
-        orders,
-        itemsByOrder,
-        truncated,
-      });
-      files.push({ filename: `${base}.pdf`, data: pdf });
-    }
-
-    if (formats.csv) {
-      const csv = buildCsv({
-        displayName,
-        periodLabel,
-        spanText,
-        summary: s,
-        totalUnits,
-        statusRows: statusQ.rows,
-        productRows: productsQ.rows,
-        orders,
-        items,
-      });
-      // BOM so Excel reads UTF-8 (₹, Tamil names) correctly.
-      files.push({
-        filename: `${base}.csv`,
-        data: Buffer.from("﻿" + csv, "utf8"),
-      });
-    }
-
-    return { found: true, displayName, summaryText, files };
+    return {
+      found: true,
+      displayName,
+      summaryText,
+      files: [
+        { filename: `${base}.pdf`, data: await buildPdf(data) },
+        // BOM so Excel reads UTF-8 (₹, Tamil names) correctly.
+        { filename: `${base}.csv`, data: Buffer.from("﻿" + buildCsv(data), "utf8") },
+      ],
+    };
   });
 }
 
-/** Shape handed to the file renderers (exported so they can be tested standalone). */
+/** Everything the PDF and CSV renderers need. */
 export interface ReportData {
   displayName: string;
   periodLabel: string;
   spanText: string;
-  summary: Record<string, unknown>;
-  totalUnits: number;
-  statusRows: Record<string, unknown>[];
-  productRows: Record<string, unknown>[];
-  orders: OrderRow[];
-  itemsByOrder?: Map<string, ItemRow[]>;
-  items?: ItemRow[];
-  truncated?: boolean;
+  totalOrders: number;
+  totalValue: number;
+  cancelledOrders: number;
+  cancelledValue: number;
+  statusRows: StatusRow[];
+  lines: LineRow[];
+  truncated: boolean;
+  thumbs?: Map<string, Buffer>;
+}
+
+/** "M · Qty 2", or just "Qty 2" when the product has no size. */
+function sizeQty(l: LineRow): string {
+  const size = (l.size ?? "").trim();
+  const qty = Number(l.qty || 0);
+  if (!l.product) return "";
+  return size ? `${size.toUpperCase()} · Qty ${num(qty)}` : `Qty ${num(qty)}`;
+}
+
+/** The detail table, shared by the full listing and the cancelled-only one. */
+function detailColumns(): Column[] {
+  return [
+    { header: "S.No", width: 0.6, align: "right" },
+    { header: "Order ID", width: 1.3 },
+    { header: "Photo", width: 0.95, image: true },
+    { header: "Product", width: 3.1 },
+    { header: "Customer", width: 2.1 },
+    { header: "Phone", width: 1.5 },
+    { header: "Size / Qty", width: 1.15 },
+    { header: "Price", width: 1.1, align: "right" },
+    { header: "Status", width: 1.3 },
+  ];
+}
+
+function detailRows(lines: LineRow[], thumbs?: Map<string, Buffer>): PdfRow[] {
+  return lines.map((l, i) => ({
+    cells: [
+      i + 1,
+      l.order_number,
+      (l.image && thumbs?.get(l.image)) || "",
+      l.product || "(no line items)",
+      l.customer,
+      l.phone,
+      sizeQty(l),
+      l.product ? inr(l.price) : inr(l.order_total),
+      statusLabel(l.status),
+    ],
+    highlight: isCancelled(l.status),
+  }));
 }
 
 export async function buildPdf(d: ReportData): Promise<Buffer> {
-  const s = d.summary;
-  const pdf = new PdfReport();
+  // Landscape: the detail table carries nine columns plus a photo.
+  const pdf = new PdfReport({ landscape: true });
 
   pdf.title(
     d.displayName,
     `Order report — ${d.periodLabel}`,
-    `${d.spanText}  ·  generated ${new Date().toISOString().slice(0, 16).replace("T", " ")} UTC`
+    `${d.spanText}  ·  generated ${new Date()
+      .toISOString()
+      .slice(0, 16)
+      .replace("T", " ")} UTC`
   );
 
+  // The date range is in the title and the summary block; a KPI box is too
+  // narrow for it.
   pdf.kpis([
-    { label: "Orders", value: String(s.orders) },
-    { label: "Total value", value: inr(s.amount) },
-    { label: "Avg order", value: inr(s.avg_order) },
-    { label: "Units", value: num(d.totalUnits) },
+    { label: "Total orders", value: num(d.totalOrders) },
+    { label: "Total order value", value: inr(d.totalValue) },
+    { label: "Cancelled orders", value: num(d.cancelledOrders) },
   ]);
 
-  pdf.totalBar("Overall total value", inr(s.amount));
+  pdf.totalBar("Total order value", inr(d.totalValue));
 
   pdf.section("Summary");
   pdf.keyValues([
-    ["Period", `${d.periodLabel} (${d.spanText})`],
-    ["Total orders", String(s.orders)],
-    ["Overall total value", inr(s.amount)],
-    ["Average order value", inr(s.avg_order)],
-    ["Total units sold", num(d.totalUnits)],
-    ["Distinct products", String(d.productRows.length)],
-    ["First order", ymd(s.first_order)],
-    ["Last order", ymd(s.last_order)],
+    ["Date range", `${d.periodLabel} (${d.spanText})`],
+    ["Total orders", num(d.totalOrders)],
+    ["Total order value", inr(d.totalValue)],
   ]);
 
-  if (d.statusRows.length > 0) {
-    pdf.section("Orders by status");
-    const cols: Column[] = [
+  pdf.section("Orders by status");
+  pdf.table(
+    [
       { header: "Status", width: 4 },
       { header: "Orders", width: 2, align: "right" },
-      { header: "Amount", width: 3, align: "right" },
-    ];
-    pdf.table(
-      cols,
-      d.statusRows.map((r) => [String(r.status), String(r.orders), inr(r.amount)])
-    );
-  }
+      { header: "Value", width: 3, align: "right" },
+    ],
+    [
+      ...d.statusRows.map((r) => ({
+        cells: [
+          statusLabel(r.status),
+          num(r.orders),
+          inr(r.amount),
+        ],
+        highlight: isCancelled(r.status),
+      })),
+      { cells: ["TOTAL", num(d.totalOrders), inr(d.totalValue)] },
+    ]
+  );
+  pdf.note(
+    d.cancelledOrders > 0
+      ? `Cancelled orders: ${num(d.cancelledOrders)} (${inr(
+          d.cancelledValue
+        )}) — highlighted in red throughout this report.`
+      : `Cancelled orders: 0 — no cancelled orders in this period.`
+  );
 
-  pdf.section("Product details");
-  if (d.productRows.length === 0) {
-    pdf.note("No line items recorded for these orders.");
-  } else {
-    const cols: Column[] = [
-      { header: "#", width: 0.8, align: "right" },
-      { header: "Product", width: 7 },
-      { header: "Orders", width: 1.5, align: "right" },
-      { header: "Units", width: 1.5, align: "right" },
-      { header: "Revenue", width: 2.4, align: "right" },
-    ];
-    const productRevenue = d.productRows.reduce((a, r) => a + Number(r.revenue || 0), 0);
-    pdf.table(
-      cols,
-      [
-        ...d.productRows.map((r, i) => [
-          i + 1,
-          String(r.product ?? "(unnamed)"),
-          String(r.orders ?? ""),
-          num(r.units),
-          inr(r.revenue),
-        ]),
-        ["", "TOTAL", "", num(d.totalUnits), inr(productRevenue)],
-      ]
-    );
-    // Line-item revenue can differ from order totals (shipping, discounts), so
-    // both figures are shown rather than silently reconciled.
-    if (Math.round(productRevenue) !== Math.round(Number(s.amount))) {
-      pdf.note(
-        `Line-item revenue ${inr(productRevenue)} differs from the order total ` +
-          `${inr(s.amount)} (shipping, discounts or charges recorded at order level).`
-      );
-    }
-  }
-
-  pdf.section("Orders");
+  pdf.section("Order details");
   if (d.truncated) {
-    pdf.note(`Showing the ${d.orders.length} most recent of ${s.orders} orders.`);
+    pdf.note(
+      `Showing the most recent ${
+        new Set(d.lines.map((l) => l.order_number)).size
+      } of ${num(d.totalOrders)} orders.`
+    );
   }
-  const orderCols: Column[] = [
-    { header: "Order #", width: 2.4 },
-    { header: "Date", width: 1.8 },
-    { header: "Customer", width: 3.6 },
-    { header: "Status", width: 1.8 },
-    { header: "Items", width: 1, align: "right" },
-    { header: "Amount", width: 2, align: "right" },
-  ];
-  const orderRows: (string | number)[][] = d.orders.map((o) => [
-    o.order_number,
-    ymd(o.created_at),
-    o.customer,
-    o.status,
-    o.items,
-    inr(o.total),
-  ]);
-  if (!d.truncated) {
-    orderRows.push(["TOTAL", "", "", "", String(s.orders), inr(s.amount)]);
-  }
-  pdf.table(orderCols, orderRows);
+  pdf.table(detailColumns(), detailRows(d.lines, d.thumbs));
 
-  // Per-order products: what was actually bought in each order.
-  const byOrder = d.itemsByOrder;
-  if (byOrder && byOrder.size > 0) {
-    pdf.section("Products in each order");
-    const itemCols: Column[] = [
-      { header: "Order #", width: 2.4 },
-      { header: "Date", width: 1.8 },
-      { header: "Product", width: 5.4 },
-      { header: "Qty", width: 1, align: "right" },
-      { header: "Unit price", width: 1.7, align: "right" },
-      { header: "Line total", width: 1.9, align: "right" },
-    ];
-    const rows: (string | number)[][] = [];
-    for (const o of d.orders) {
-      const list = byOrder.get(o.order_number);
-      if (!list) continue;
-      list.forEach((it, i) => {
-        const qty = Number(it.qty || 0);
-        const unit = Number(it.price) || (qty > 0 ? Number(it.line_total) / qty : 0);
-        rows.push([
-          i === 0 ? o.order_number : "",
-          i === 0 ? ymd(o.created_at) : "",
-          it.product ?? "(unnamed)",
-          num(qty),
-          inr(unit),
-          inr(it.line_total),
-        ]);
-      });
-    }
-    pdf.table(itemCols, rows);
+  const cancelledLines = d.lines.filter((l) => isCancelled(l.status));
+  if (cancelledLines.length > 0) {
+    pdf.section("Cancelled orders");
+    pdf.table(detailColumns(), detailRows(cancelledLines, d.thumbs));
   }
 
   return pdf.finish(`${d.displayName} · ${d.periodLabel}`);
 }
 
 export function buildCsv(d: ReportData): string {
-  const s = d.summary;
   const lines: string[] = [];
   lines.push(`${d.displayName} - Order report - ${d.periodLabel}`);
-  lines.push(`Period,${csvCell(d.spanText)}`);
   lines.push("");
   lines.push("Summary");
   lines.push(csvRow(["metric", "value"]));
-  lines.push(csvRow(["Total orders", s.orders]));
-  lines.push(csvRow(["Overall total value", money(s.amount)]));
-  lines.push(csvRow(["Average order value", money(s.avg_order)]));
-  lines.push(csvRow(["Total units sold", d.totalUnits]));
-  lines.push(csvRow(["Distinct products", d.productRows.length]));
-  lines.push(csvRow(["First order", ymd(s.first_order)]));
-  lines.push(csvRow(["Last order", ymd(s.last_order)]));
+  lines.push(csvRow(["Date range", d.spanText]));
+  lines.push(csvRow(["Total orders", d.totalOrders]));
+  lines.push(csvRow(["Total order value", money(d.totalValue)]));
+  lines.push(csvRow(["Cancelled orders", d.cancelledOrders]));
+  lines.push(csvRow(["Cancelled order value", money(d.cancelledValue)]));
   lines.push("");
   lines.push("Orders by status");
-  lines.push(csvRow(["status", "orders", "amount"]));
-  for (const r of d.statusRows)
-    lines.push(csvRow([r.status, r.orders, money(r.amount)]));
+  lines.push(csvRow(["status", "cancelled", "orders", "value"]));
+  for (const r of d.statusRows) {
+    lines.push(
+      csvRow([r.status, isCancelled(r.status) ? "YES" : "", r.orders, money(r.amount)])
+    );
+  }
+  lines.push(csvRow(["TOTAL", "", d.totalOrders, money(d.totalValue)]));
   lines.push("");
-  lines.push("Product details");
-  lines.push(csvRow(["product", "orders", "units", "revenue"]));
-  for (const r of d.productRows)
-    lines.push(csvRow([r.product, r.orders, Number(r.units), money(r.revenue)]));
+  lines.push("Order details");
   lines.push(
     csvRow([
-      "TOTAL",
-      "",
-      d.totalUnits,
-      money(d.productRows.reduce((a, r) => a + Number(r.revenue || 0), 0)),
+      "s_no", "order_id", "order_date", "product", "size", "quantity",
+      "product_price", "line_total", "customer_name", "customer_phone",
+      "order_status", "cancelled", "order_total", "product_image",
     ])
   );
-  lines.push("");
-  lines.push("Orders");
-  lines.push(csvRow(["order_number", "date", "customer", "status", "items", "amount"]));
-  for (const o of d.orders)
+  d.lines.forEach((l, i) => {
     lines.push(
-      csvRow([o.order_number, ymd(o.created_at), o.customer, o.status, o.items, money(o.total)])
+      csvRow([
+        i + 1,
+        l.order_number,
+        ymd(l.created_at),
+        l.product,
+        l.size,
+        Number(l.qty || 0),
+        money(l.price),
+        money(l.line_total),
+        l.customer,
+        l.phone,
+        l.status,
+        isCancelled(l.status) ? "YES" : "",
+        money(l.order_total),
+        l.image,
+      ])
     );
-  lines.push(csvRow(["TOTAL", "", "", "", "", money(s.amount)]));
-
-  if (d.items && d.items.length > 0) {
-    lines.push("");
-    lines.push("Products in each order");
-    lines.push(csvRow(["order_number", "product", "quantity", "unit_price", "line_total"]));
-    for (const it of d.items) {
-      const qty = Number(it.qty || 0);
-      const unit = Number(it.price) || (qty > 0 ? Number(it.line_total) / qty : 0);
-      lines.push(
-        csvRow([it.order_number, it.product, qty, money(unit), money(it.line_total)])
-      );
-    }
-  }
-
+  });
   return lines.join("\r\n") + "\r\n";
 }
